@@ -10,7 +10,7 @@
     "build": "tsc",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
-    "check": "npm run build && node dist/cli.js hello",
+    "check": "npm test && node dist/cli.js hello",
     "test": "npm run build && vitest run",
     "test:watch": "vitest"
   },
