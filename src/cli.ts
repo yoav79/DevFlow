@@ -9,6 +9,7 @@ import { runTaskCreateCommand } from "./commands/task-create.js";
 import { runTaskListCommand } from "./commands/task-list.js";
 import { runStatusCommand } from "./commands/status.js";
 import { runInspectCommand } from "./commands/inspect.js";
+import { runSupervisorStartCommand } from "./commands/supervisor-start.js";
 
 const program = new Command();
 
@@ -70,6 +71,16 @@ taskCommand
   .requiredOption("--project <project-id>", "Identificador del proyecto")
   .action((options) => {
     runTaskListCommand(options as { project: string });
+  });
+
+const supervisorCommand = program.command("supervisor").description("Controla la fase del supervisor");
+
+supervisorCommand
+  .command("start")
+  .description("Inicia explícitamente la generación de contrato de una tarea")
+  .requiredOption("--task <task-id>", "Identificador de la tarea")
+  .action((options) => {
+    runSupervisorStartCommand(options as { task: string });
   });
 
 program
