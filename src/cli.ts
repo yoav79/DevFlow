@@ -6,6 +6,7 @@ import { runInitCommand } from "./commands/init.js";
 import { runProjectAddCommand } from "./commands/project-add.js";
 import { runProjectListCommand } from "./commands/project-list.js";
 import { runTaskCreateCommand } from "./commands/task-create.js";
+import { runTaskListCommand } from "./commands/task-list.js";
 
 const program = new Command();
 
@@ -59,6 +60,14 @@ taskCommand
   .requiredOption("--description <description>", "Descripción de la tarea")
   .action((options) => {
     runTaskCreateCommand(options as { project: string; id: string; title: string; description: string });
+  });
+
+taskCommand
+  .command("list")
+  .description("Lista las tareas de un proyecto")
+  .requiredOption("--project <project-id>", "Identificador del proyecto")
+  .action((options) => {
+    runTaskListCommand(options as { project: string });
   });
 
 async function main(): Promise<void> {
