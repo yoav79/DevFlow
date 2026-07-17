@@ -7,6 +7,7 @@ import { runProjectAddCommand } from "./commands/project-add.js";
 import { runProjectListCommand } from "./commands/project-list.js";
 import { runTaskCreateCommand } from "./commands/task-create.js";
 import { runTaskListCommand } from "./commands/task-list.js";
+import { runStatusCommand } from "./commands/status.js";
 
 const program = new Command();
 
@@ -68,6 +69,14 @@ taskCommand
   .requiredOption("--project <project-id>", "Identificador del proyecto")
   .action((options) => {
     runTaskListCommand(options as { project: string });
+  });
+
+program
+  .command("status")
+  .description("Muestra el estado operativo de un proyecto")
+  .requiredOption("--project <project-id>", "Identificador del proyecto")
+  .action((options) => {
+    runStatusCommand(options as { project: string });
   });
 
 async function main(): Promise<void> {
