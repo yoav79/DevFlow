@@ -114,6 +114,41 @@ export function initializeSchema(database: DatabaseSync): void {
       CREATE INDEX IF NOT EXISTS idx_human_requests_pending
         ON human_requests(status)
         WHERE status = 'PENDING';
+
+      CREATE TABLE IF NOT EXISTS task_workspaces (
+        id TEXT PRIMARY KEY NOT NULL,
+        taskId TEXT NOT NULL,
+        executionNumber INTEGER NOT NULL,
+        workspacePath TEXT NOT NULL,
+        branchName TEXT NOT NULL,
+        baseCommit TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PREPARING',
+        createdAt TEXT NOT NULL,
+        removedAt TEXT NULL,
+        FOREIGN KEY (taskId) REFERENCES tasks(id) ON DELETE RESTRICT,
+        UNIQUE (taskId, executionNumber),
+        UNIQUE (workspacePath),
+        CHECK (executionNumber >= 1),
+        CHECK (
+          status IN (
+            'PREPARING',
+            'READY',
+            'FAILED',
+            'REMOVED'
+          )
+        ),
+        CHECK (
+          (status = 'REMOVED' AND removedAt IS NOT NULL)
+          OR
+          (status != 'REMOVED' AND removedAt IS NULL)
+        )
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_task_workspaces_task_id
+        ON task_workspaces(taskId);
+
+      CREATE INDEX IF NOT EXISTS idx_task_workspaces_status
+        ON task_workspaces(status);
     `);
     database.exec("COMMIT;");
   } catch (error) {

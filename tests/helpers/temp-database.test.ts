@@ -59,7 +59,7 @@ describe("createTempDatabase", () => {
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name ASC")
       .all() as Array<{ name: string }>;
 
-    expect(rows.map((row) => row.name)).toEqual(["human_requests", "projects", "tasks"]);
+    expect(rows.map((row) => row.name)).toEqual(["human_requests", "projects", "task_workspaces", "tasks"]);
   });
 
   it("initializes the schema and can run it again", () => {

@@ -146,3 +146,33 @@ export type SupervisorResult =
  * El nombre de dominio se conserva para consumo futuro del executor.
  */
 export type TaskContract = ExecutableTaskContract;
+
+export const TASK_WORKSPACE_STATUSES = [
+  "PREPARING",
+  "READY",
+  "FAILED",
+  "REMOVED",
+] as const;
+
+export type TaskWorkspaceStatus = (typeof TASK_WORKSPACE_STATUSES)[number];
+
+export interface TaskWorkspace {
+  id: string;
+  taskId: string;
+  executionNumber: number;
+  workspacePath: string;
+  branchName: string;
+  baseCommit: string;
+  status: TaskWorkspaceStatus;
+  createdAt: string;
+  removedAt: string | null;
+}
+
+export interface CreateTaskWorkspaceInput {
+  id: string;
+  taskId: string;
+  executionNumber: number;
+  workspacePath: string;
+  branchName: string;
+  baseCommit: string;
+}
