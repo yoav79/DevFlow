@@ -13,6 +13,7 @@ import { runSupervisorStartCommand } from "./commands/supervisor-start.js";
 import { runSupervisorApplyCommand } from "./commands/supervisor-apply.js";
 import { runContractDecideCommand } from "./commands/contract-decide.js";
 import { runRequestListCommand } from "./commands/request-list.js";
+import { runRequestDecideCommand } from "./commands/request-decide.js";
 
 const program = new Command();
 
@@ -107,7 +108,7 @@ contractCommand
     runContractDecideCommand(options as { request: string; decision: string; comment?: string });
   });
 
-const requestCommand = program.command("request").description("Lista solicitudes humanas");
+const requestCommand = program.command("request").description("Gestiona solicitudes humanas");
 
 requestCommand
   .command("list")
@@ -115,6 +116,16 @@ requestCommand
   .requiredOption("--task <task-id>", "Identificador de la tarea")
   .action((options) => {
     runRequestListCommand(options as { task: string });
+  });
+
+requestCommand
+  .command("decide")
+  .description("Resuelve manualmente una decisión funcional")
+  .requiredOption("--request <request-id>", "Identificador de la solicitud")
+  .requiredOption("--decision <decision>", "Decisión funcional")
+  .option("--comment <text>", "Comentario humano")
+  .action((options) => {
+    runRequestDecideCommand(options as { request: string; decision: string; comment?: string });
   });
 
 program
