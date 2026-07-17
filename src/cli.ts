@@ -8,6 +8,7 @@ import { runProjectListCommand } from "./commands/project-list.js";
 import { runTaskCreateCommand } from "./commands/task-create.js";
 import { runTaskListCommand } from "./commands/task-list.js";
 import { runStatusCommand } from "./commands/status.js";
+import { runInspectCommand } from "./commands/inspect.js";
 
 const program = new Command();
 
@@ -77,6 +78,14 @@ program
   .requiredOption("--project <project-id>", "Identificador del proyecto")
   .action((options) => {
     runStatusCommand(options as { project: string });
+  });
+
+program
+  .command("inspect")
+  .description("Muestra el detalle operativo de una tarea")
+  .requiredOption("--task <task-id>", "Identificador de la tarea")
+  .action((options) => {
+    runInspectCommand(options as { task: string });
   });
 
 async function main(): Promise<void> {
