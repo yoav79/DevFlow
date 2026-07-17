@@ -10,6 +10,7 @@ import { runTaskListCommand } from "./commands/task-list.js";
 import { runStatusCommand } from "./commands/status.js";
 import { runInspectCommand } from "./commands/inspect.js";
 import { runSupervisorStartCommand } from "./commands/supervisor-start.js";
+import { runSupervisorApplyCommand } from "./commands/supervisor-apply.js";
 
 const program = new Command();
 
@@ -81,6 +82,15 @@ supervisorCommand
   .requiredOption("--task <task-id>", "Identificador de la tarea")
   .action((options) => {
     runSupervisorStartCommand(options as { task: string });
+  });
+
+supervisorCommand
+  .command("apply")
+  .description("Aplica manualmente un resultado del supervisor a una tarea")
+  .requiredOption("--task <task-id>", "Identificador de la tarea")
+  .requiredOption("--result <json-file>", "Archivo JSON con el resultado del supervisor")
+  .action((options) => {
+    runSupervisorApplyCommand(options as { task: string; result: string });
   });
 
 program
