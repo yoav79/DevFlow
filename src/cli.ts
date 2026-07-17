@@ -12,6 +12,7 @@ import { runInspectCommand } from "./commands/inspect.js";
 import { runSupervisorStartCommand } from "./commands/supervisor-start.js";
 import { runSupervisorApplyCommand } from "./commands/supervisor-apply.js";
 import { runContractDecideCommand } from "./commands/contract-decide.js";
+import { runRequestListCommand } from "./commands/request-list.js";
 
 const program = new Command();
 
@@ -104,6 +105,16 @@ contractCommand
   .option("--comment <text>", "Comentario humano")
   .action((options) => {
     runContractDecideCommand(options as { request: string; decision: string; comment?: string });
+  });
+
+const requestCommand = program.command("request").description("Lista solicitudes humanas");
+
+requestCommand
+  .command("list")
+  .description("Lista las solicitudes humanas pendientes de una tarea")
+  .requiredOption("--task <task-id>", "Identificador de la tarea")
+  .action((options) => {
+    runRequestListCommand(options as { task: string });
   });
 
 program
