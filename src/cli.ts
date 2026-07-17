@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+
+import { Command } from "commander";
+
+import { runInitCommand } from "./commands/init.js";
+import { runProjectAddCommand } from "./commands/project-add.js";
+import { runProjectListCommand } from "./commands/project-list.js";
+
+const program = new Command();
+
+program
+  .name("devflow")
+  .description("Orquestador local de desarrollo multiagente")
+  .version("0.1.0");
+
+program
+  .command("hello")
+  .description("Verifica que DevFlow está funcionando")
+  .action(() => {
+    console.log("DevFlow MVP1 está funcionando.");
+  });
+
+program
+  .command("init")
+  .description("Inicializa el almacenamiento local de DevFlow")
+  .action(() => {
+    runInitCommand();
+  });
+
+const projectCommand = program.command("project").description("Gestiona proyectos registrados");
+
+projectCommand
+  .command("add")
+  .description("Registra un repositorio Git externo")
+  .argument("<repository-path>")
+  .requiredOption("--id <id>", "Identificador del proyecto")
+  .requiredOption("--name <name>", "Nombre del proyecto")
+  .option("--branch <branch>", "Rama por defecto")
+  .action((repositoryPath, options) => {
+    runProjectAddCommand(repositoryPath, options as { id: string; name: string; branch?: string });
+  });
+
+projectCommand
+  .command("list")
+  .description("Lista los proyectos registrados")
+  .action(() => {
+    runProjectListCommand();
+  });
+
+async function main(): Promise<void> {
+  try {
+    await program.parseAsync(process.argv);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  }
+}
+
+void main();
