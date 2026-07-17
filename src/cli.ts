@@ -11,6 +11,7 @@ import { runStatusCommand } from "./commands/status.js";
 import { runInspectCommand } from "./commands/inspect.js";
 import { runSupervisorStartCommand } from "./commands/supervisor-start.js";
 import { runSupervisorApplyCommand } from "./commands/supervisor-apply.js";
+import { runContractDecideCommand } from "./commands/contract-decide.js";
 
 const program = new Command();
 
@@ -91,6 +92,18 @@ supervisorCommand
   .requiredOption("--result <json-file>", "Archivo JSON con el resultado del supervisor")
   .action((options) => {
     runSupervisorApplyCommand(options as { task: string; result: string });
+  });
+
+const contractCommand = program.command("contract").description("Resuelve decisiones contractuales");
+
+contractCommand
+  .command("decide")
+  .description("Resuelve manualmente una aprobación contractual")
+  .requiredOption("--request <request-id>", "Identificador de la solicitud")
+  .requiredOption("--decision <decision>", "Decisión contractual")
+  .option("--comment <text>", "Comentario humano")
+  .action((options) => {
+    runContractDecideCommand(options as { request: string; decision: string; comment?: string });
   });
 
 program
