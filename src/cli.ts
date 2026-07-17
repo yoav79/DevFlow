@@ -5,6 +5,7 @@ import { Command } from "commander";
 import { runInitCommand } from "./commands/init.js";
 import { runProjectAddCommand } from "./commands/project-add.js";
 import { runProjectListCommand } from "./commands/project-list.js";
+import { runTaskCreateCommand } from "./commands/task-create.js";
 
 const program = new Command();
 
@@ -45,6 +46,19 @@ projectCommand
   .description("Lista los proyectos registrados")
   .action(() => {
     runProjectListCommand();
+  });
+
+const taskCommand = program.command("task").description("Gestiona tareas de DevFlow");
+
+taskCommand
+  .command("create")
+  .description("Crea una tarea para un proyecto registrado")
+  .requiredOption("--project <project-id>", "Identificador del proyecto")
+  .requiredOption("--id <task-id>", "Identificador de la tarea")
+  .requiredOption("--title <title>", "Título de la tarea")
+  .requiredOption("--description <description>", "Descripción de la tarea")
+  .action((options) => {
+    runTaskCreateCommand(options as { project: string; id: string; title: string; description: string });
   });
 
 async function main(): Promise<void> {
