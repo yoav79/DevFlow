@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   FunctionalDecisionResolutionError,
   resolveFunctionalDecision,
+  resolveFunctionalDecisionByChoice,
 } from "../../src/services/functional-decision-resolution-service.js";
 import {
   applySupervisorResult,
@@ -1456,6 +1457,810 @@ describe("resolveFunctionalDecision", () => {
 
       const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
       expect(Object.keys(resolution).sort()).toEqual(["decision", "origin"]);
+    });
+  });
+});
+
+describe("resolveFunctionalDecisionByChoice", () => {
+  let tempDb: TempDatabase;
+
+  afterEach(() => {
+    tempDb?.cleanup();
+  });
+
+  describe("EDIT_DECOMPOSITION", () => {
+    it("resolves a decomposition request without receiving origin", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify scope",
+      });
+
+      expect(result.requestId).toBe(request.id);
+      expect(result.taskId).toBe(task.id);
+    });
+
+    it("infers DECOMPOSITION from optionsJson", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+
+      expect(result.origin).toBe("DECOMPOSITION");
+    });
+
+    it("changes the task to GENERATING_CONTRACT", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+
+      expect(result.currentTaskState).toBe("GENERATING_CONTRACT");
+      expect(getTaskById(tempDb.database, task.id)?.state).toBe("GENERATING_CONTRACT");
+    });
+
+    it("stores origin DECOMPOSITION", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect(resolution.origin).toBe("DECOMPOSITION");
+    });
+
+    it("stores decision EDIT_DECOMPOSITION", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect(resolution.decision).toBe("EDIT_DECOMPOSITION");
+    });
+
+    it("normalizes comment via the core", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "  Simplify  ",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect(resolution.comment).toBe("Simplify");
+    });
+
+    it("rejects empty comment via the core", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "",
+        }),
+      ).toThrow("La decisión EDIT_DECOMPOSITION requiere un comentario.");
+    });
+
+    it("rejects EDIT_DECOMPOSITION over discovery request", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow(FunctionalDecisionResolutionError);
+    });
+
+    it("does not modify the received choice object", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const choice = {
+        decision: "EDIT_DECOMPOSITION" as const,
+        comment: "  Simplify  ",
+      };
+      const copy = JSON.parse(JSON.stringify(choice));
+
+      resolveFunctionalDecisionByChoice(tempDb.database, request.id, choice);
+
+      expect(choice).toEqual(copy);
+    });
+  });
+
+  describe("PROVIDE_INFORMATION", () => {
+    it("resolves a discovery request without receiving origin", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "PROVIDE_INFORMATION",
+        comment: "Latency is 200ms",
+      });
+
+      expect(result.requestId).toBe(request.id);
+      expect(result.taskId).toBe(task.id);
+    });
+
+    it("infers DISCOVERY from optionsJson", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "PROVIDE_INFORMATION",
+        comment: "Latency is 200ms",
+      });
+
+      expect(result.origin).toBe("DISCOVERY");
+    });
+
+    it("changes the task to GENERATING_CONTRACT", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "PROVIDE_INFORMATION",
+        comment: "Latency is 200ms",
+      });
+
+      expect(result.currentTaskState).toBe("GENERATING_CONTRACT");
+      expect(getTaskById(tempDb.database, task.id)?.state).toBe("GENERATING_CONTRACT");
+    });
+
+    it("stores origin DISCOVERY", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "PROVIDE_INFORMATION",
+        comment: "Latency is 200ms",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect(resolution.origin).toBe("DISCOVERY");
+    });
+
+    it("stores decision PROVIDE_INFORMATION", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "PROVIDE_INFORMATION",
+        comment: "Latency is 200ms",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect(resolution.decision).toBe("PROVIDE_INFORMATION");
+    });
+
+    it("normalizes information via the core", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "PROVIDE_INFORMATION",
+        comment: "  Latency is 200ms  ",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect(resolution.comment).toBe("Latency is 200ms");
+    });
+
+    it("rejects empty information via the core", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "PROVIDE_INFORMATION",
+          comment: "",
+        }),
+      ).toThrow("La decisión PROVIDE_INFORMATION requiere información.");
+    });
+
+    it("rejects PROVIDE_INFORMATION over decomposition request", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "PROVIDE_INFORMATION",
+          comment: "Info",
+        }),
+      ).toThrow(FunctionalDecisionResolutionError);
+    });
+
+    it("does not modify the received choice object", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      const choice = {
+        decision: "PROVIDE_INFORMATION" as const,
+        comment: "  Info  ",
+      };
+      const copy = JSON.parse(JSON.stringify(choice));
+
+      resolveFunctionalDecisionByChoice(tempDb.database, request.id, choice);
+
+      expect(choice).toEqual(copy);
+    });
+  });
+
+  describe("CANCEL_TASK", () => {
+    it("cancels a decomposition request without receiving origin", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "CANCEL_TASK",
+      });
+
+      expect(result.decision).toBe("CANCEL_TASK");
+      expect(result.currentTaskState).toBe("CANCELLED");
+    });
+
+    it("cancels a discovery request without receiving origin", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDiscoveryRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "CANCEL_TASK",
+      });
+
+      expect(result.decision).toBe("CANCEL_TASK");
+      expect(result.currentTaskState).toBe("CANCELLED");
+    });
+
+    it("changes the task to CANCELLED", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "CANCEL_TASK",
+      });
+
+      expect(getTaskById(tempDb.database, task.id)?.state).toBe("CANCELLED");
+    });
+
+    it("stores the inferred origin correctly", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "CANCEL_TASK",
+      });
+
+      expect(result.origin).toBe("DECOMPOSITION");
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect(resolution.origin).toBe("DECOMPOSITION");
+    });
+
+    it("allows comment absent", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "CANCEL_TASK",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect("comment" in resolution).toBe(false);
+    });
+
+    it("allows comment present", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "CANCEL_TASK",
+        comment: "No longer needed",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect(resolution.comment).toBe("No longer needed");
+    });
+
+    it("delegates comment normalization to the core", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "CANCEL_TASK",
+        comment: "   ",
+      });
+
+      const resolution = parseResolutionJson(result.humanRequest.resolutionJson ?? "{}");
+      expect("comment" in resolution).toBe(false);
+    });
+
+    it("does not modify the received choice object", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const choice = {
+        decision: "CANCEL_TASK" as const,
+        comment: "  Cancel  ",
+      };
+      const copy = JSON.parse(JSON.stringify(choice));
+
+      resolveFunctionalDecisionByChoice(tempDb.database, request.id, choice);
+
+      expect(choice).toEqual(copy);
+    });
+  });
+
+  describe("validations", () => {
+    it("rejects empty requestId", () => {
+      tempDb = createTempDatabase();
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, "", {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow("El id de la solicitud no puede estar vacío.");
+    });
+
+    it("rejects nonexistent request", () => {
+      tempDb = createTempDatabase();
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, "missing", {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow("No existe la solicitud humana: missing");
+    });
+
+    it("rejects request of another type", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+
+      const request: HumanRequest = {
+        id: "wrong-type-req",
+        taskId: task.id,
+        type: "CONTRACT_APPROVAL",
+        question: "Approve?",
+        optionsJson: JSON.stringify(["YES", "NO"]),
+        resolutionJson: null,
+        status: "PENDING",
+        createdAt: new Date().toISOString(),
+        resolvedAt: null,
+      };
+      createHumanRequest(tempDb.database, request);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow("no es una decisión funcional");
+    });
+
+    it("rejects RESOLVED request", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      tempDb.database
+        .prepare("UPDATE human_requests SET status = 'RESOLVED', resolutionJson = '{}', resolvedAt = ? WHERE id = ?")
+        .run(new Date().toISOString(), request.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow("ya está cerrada con estado RESOLVED");
+    });
+
+    it("rejects REJECTED request", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      tempDb.database
+        .prepare("UPDATE human_requests SET status = 'REJECTED', resolvedAt = ? WHERE id = ?")
+        .run(new Date().toISOString(), request.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow("ya está cerrada con estado REJECTED");
+    });
+
+    it("rejects null optionsJson", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      tempDb.database
+        .prepare("UPDATE human_requests SET optionsJson = ? WHERE id = ?")
+        .run("null", request.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow("No se puede determinar el origen");
+    });
+
+    it("rejects invalid optionsJson", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      tempDb.database
+        .prepare("UPDATE human_requests SET optionsJson = ? WHERE id = ?")
+        .run("not-json", request.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow("No se puede determinar el origen");
+    });
+
+    it("rejects optionsJson that does not correspond to a known origin", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      tempDb.database
+        .prepare("UPDATE human_requests SET optionsJson = ? WHERE id = ?")
+        .run(JSON.stringify(["UNKNOWN"]), request.id);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow("No se puede determinar el origen");
+    });
+  });
+
+  describe("delegation and transaction", () => {
+    it("returns ResolveFunctionalDecisionResult without transformation", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+
+      expect(result).toHaveProperty("requestId");
+      expect(result).toHaveProperty("taskId");
+      expect(result).toHaveProperty("origin");
+      expect(result).toHaveProperty("decision");
+      expect(result).toHaveProperty("previousTaskState");
+      expect(result).toHaveProperty("currentTaskState");
+      expect(result).toHaveProperty("humanRequest");
+    });
+
+    it("resolution remains atomic", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      tempDb.database.exec(`
+        CREATE TRIGGER IF NOT EXISTS abort_task_update_bychoice
+        AFTER UPDATE ON tasks
+        BEGIN
+          SELECT RAISE(ABORT, 'task abort');
+        END;
+      `);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Simplify",
+        }),
+      ).toThrow();
+
+      expect(getHumanRequestById(tempDb.database, request.id)?.status).toBe("PENDING");
+    });
+
+    it("a failure in updateTaskState produces full rollback", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      tempDb.database.exec(`
+        CREATE TRIGGER IF NOT EXISTS abort_task_update_bychoice_2
+        AFTER UPDATE ON tasks
+        BEGIN
+          SELECT RAISE(ABORT, 'task abort');
+        END;
+      `);
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "CANCEL_TASK",
+        }),
+      ).toThrow();
+
+      expect(getHumanRequestById(tempDb.database, request.id)?.resolutionJson).toBeNull();
+      expect(getHumanRequestById(tempDb.database, request.id)?.resolvedAt).toBeNull();
+      expect(getTaskById(tempDb.database, task.id)?.state).toBe("HUMAN_REQUIRED");
+    });
+
+    it("no additional transaction remains open", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+
+      expect(getTaskById(tempDb.database, task.id)?.state).toBe("GENERATING_CONTRACT");
+    });
+
+    it("does not duplicate requests or transitions", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "First",
+      });
+
+      expect(() =>
+        resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+          decision: "EDIT_DECOMPOSITION",
+          comment: "Second",
+        }),
+      ).toThrow(FunctionalDecisionResolutionError);
+
+      expect(getHumanRequestById(tempDb.database, request.id)?.status).toBe("RESOLVED");
+    });
+
+    it("changes persist after reopening SQLite", async () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      resolveFunctionalDecisionByChoice(tempDb.database, request.id, {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+      tempDb.close();
+
+      const { DatabaseSync } = await import("node:sqlite");
+      const { initializeSchema } = await import("../../src/db.js");
+      const db = new DatabaseSync(tempDb.databasePath);
+      initializeSchema(db);
+
+      expect(getTaskById(db, task.id)?.state).toBe("GENERATING_CONTRACT");
+      expect(getHumanRequestById(db, request.id)?.status).toBe("RESOLVED");
+      db.close();
+    });
+  });
+
+  describe("existing API", () => {
+    it("all existing tests for resolveFunctionalDecision still pass", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecision(tempDb.database, request.id, {
+        origin: "DECOMPOSITION",
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+
+      expect(result.humanRequest.status).toBe("RESOLVED");
+    });
+
+    it("resolveFunctionalDecision preserves its signature", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id);
+      moveToGeneratingContract(tempDb, task.id);
+      const request = createDecompositionRequest(tempDb, task.id);
+
+      const result = resolveFunctionalDecision(tempDb.database, request.id, {
+        origin: "DECOMPOSITION",
+        decision: "CANCEL_TASK",
+      });
+
+      expect(result.decision).toBe("CANCEL_TASK");
+    });
+
+    it("FunctionalDecisionResolution keeps its four variants", () => {
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+
+      const task1 = createTestTask(tempDb, project.id, { id: "task-v1" });
+      moveToGeneratingContract(tempDb, task1.id);
+      const decompReq1 = createDecompositionRequest(tempDb, task1.id);
+
+      const task2 = createTestTask(tempDb, project.id, { id: "task-v2" });
+      moveToGeneratingContract(tempDb, task2.id);
+      const decompReq2 = createDecompositionRequest(tempDb, task2.id);
+
+      const task3 = createTestTask(tempDb, project.id, { id: "task-v3" });
+      moveToGeneratingContract(tempDb, task3.id);
+      const discoveryReq1 = createDiscoveryRequest(tempDb, task3.id);
+
+      const task4 = createTestTask(tempDb, project.id, { id: "task-v4" });
+      moveToGeneratingContract(tempDb, task4.id);
+      const discoveryReq2 = createDiscoveryRequest(tempDb, task4.id);
+
+      resolveFunctionalDecision(tempDb.database, decompReq1.id, {
+        origin: "DECOMPOSITION",
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      });
+      resolveFunctionalDecision(tempDb.database, decompReq2.id, {
+        origin: "DECOMPOSITION",
+        decision: "CANCEL_TASK",
+      });
+
+      resolveFunctionalDecision(tempDb.database, discoveryReq1.id, {
+        origin: "DISCOVERY",
+        decision: "PROVIDE_INFORMATION",
+        comment: "Info",
+      });
+      resolveFunctionalDecision(tempDb.database, discoveryReq2.id, {
+        origin: "DISCOVERY",
+        decision: "CANCEL_TASK",
+      });
+    });
+
+    it("inferOrigin helper is not exported", async () => {
+      const mod = await import("../../src/services/functional-decision-resolution-service.js");
+      expect(mod).not.toHaveProperty("inferOrigin");
+    });
+
+    it("FunctionalDecisionChoice does not contain origin", () => {
+      const choice: import("../../src/services/functional-decision-resolution-service.js").FunctionalDecisionChoice = {
+        decision: "EDIT_DECOMPOSITION",
+        comment: "Simplify",
+      };
+      expect("origin" in choice).toBe(false);
+    });
+
+    it("FunctionalDecisionChoice does not contain ACCEPT_DECOMPOSITION", () => {
+      const choice: import("../../src/services/functional-decision-resolution-service.js").FunctionalDecisionChoice = {
+        decision: "CANCEL_TASK",
+      };
+      expect(JSON.stringify(choice)).not.toContain("ACCEPT_DECOMPOSITION");
+    });
+
+    it("FunctionalDecisionChoice does not contain RUN_DISCOVERY", () => {
+      const choice: import("../../src/services/functional-decision-resolution-service.js").FunctionalDecisionChoice = {
+        decision: "CANCEL_TASK",
+      };
+      expect(JSON.stringify(choice)).not.toContain("RUN_DISCOVERY");
     });
   });
 });

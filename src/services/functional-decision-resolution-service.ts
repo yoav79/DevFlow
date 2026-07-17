@@ -128,6 +128,112 @@ function buildResolutionJson(
   return JSON.stringify({ origin, decision, comment });
 }
 
+export type FunctionalDecisionChoice =
+  | {
+      decision: "EDIT_DECOMPOSITION";
+      comment: string;
+    }
+  | {
+      decision: "PROVIDE_INFORMATION";
+      comment: string;
+    }
+  | {
+      decision: "CANCEL_TASK";
+      comment?: string;
+    };
+
+export function resolveFunctionalDecisionByChoice(
+  database: DatabaseSync,
+  requestId: string,
+  choice: FunctionalDecisionChoice,
+): ResolveFunctionalDecisionResult {
+  const id = requestId.trim();
+
+  if (id.length === 0) {
+    throw new Error("El id de la solicitud no puede estar vacío.");
+  }
+
+  const request = getHumanRequestById(database, id);
+  if (request === null) {
+    throw new Error(`No existe la solicitud humana: ${id}`);
+  }
+
+  if (request.type !== "FUNCTIONAL_DECISION") {
+    throw new FunctionalDecisionResolutionError(
+      id,
+      `La solicitud ${id} no es una decisión funcional.`,
+    );
+  }
+
+  if (request.status !== "PENDING") {
+    throw new FunctionalDecisionResolutionError(
+      id,
+      `La solicitud ${id} ya está cerrada con estado ${request.status}.`,
+    );
+  }
+
+  const inferredOrigin = inferOrigin(id, request.optionsJson);
+
+  if (choice.decision === "EDIT_DECOMPOSITION" && inferredOrigin !== "DECOMPOSITION") {
+    throw new FunctionalDecisionResolutionError(
+      id,
+      `La decisión EDIT_DECOMPOSITION no es compatible con el origen ${inferredOrigin} de la solicitud ${id}.`,
+    );
+  }
+
+  if (choice.decision === "PROVIDE_INFORMATION" && inferredOrigin !== "DISCOVERY") {
+    throw new FunctionalDecisionResolutionError(
+      id,
+      `La decisión PROVIDE_INFORMATION no es compatible con el origen ${inferredOrigin} de la solicitud ${id}.`,
+    );
+  }
+
+  let resolution: FunctionalDecisionResolution;
+
+  switch (choice.decision) {
+    case "EDIT_DECOMPOSITION": {
+      resolution = {
+        origin: inferredOrigin as "DECOMPOSITION",
+        decision: "EDIT_DECOMPOSITION",
+        comment: choice.comment,
+      };
+      break;
+    }
+    case "PROVIDE_INFORMATION": {
+      resolution = {
+        origin: inferredOrigin as "DISCOVERY",
+        decision: "PROVIDE_INFORMATION",
+        comment: choice.comment,
+      };
+      break;
+    }
+    case "CANCEL_TASK": {
+      if (choice.comment === undefined) {
+        resolution = {
+          origin: inferredOrigin as "DECOMPOSITION" | "DISCOVERY",
+          decision: "CANCEL_TASK",
+        };
+      } else {
+        resolution = {
+          origin: inferredOrigin as "DECOMPOSITION" | "DISCOVERY",
+          decision: "CANCEL_TASK",
+          comment: choice.comment,
+        };
+      }
+      break;
+    }
+    default: {
+      const _exhaustive: never = choice;
+      throw new FunctionalDecisionResolutionError(
+        id,
+        `Decisión desconocida: ${String(_exhaustive)}`,
+      );
+    }
+  }
+
+  return resolveFunctionalDecision(database, id, resolution);
+}
+
 export function resolveFunctionalDecision(
   database: DatabaseSync,
   requestId: string,
