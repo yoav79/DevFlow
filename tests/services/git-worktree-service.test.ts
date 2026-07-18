@@ -1,11 +1,11 @@
-import { writeFileSync, mkdirSync, rmSync, symlinkSync, existsSync, chmodSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync, symlinkSync, existsSync, chmodSync, lstatSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createTempDirectory } from "../helpers/temp-directory.js";
 import { createTempGitRepository } from "../helpers/temp-git-repository.js";
-import { GitWorktreeError, preflightGitWorktree } from "../../src/services/git-worktree-service.js";
+import { createGitWorktree, GitWorktreeError, preflightGitWorktree } from "../../src/services/git-worktree-service.js";
 
 function expectWorktreeError(action: () => unknown, message: string): void {
   try {
@@ -14,17 +14,6 @@ function expectWorktreeError(action: () => unknown, message: string): void {
   } catch (error) {
     expect(error).toBeInstanceOf(GitWorktreeError);
     expect((error as GitWorktreeError).message).toBe(message);
-  }
-}
-
-function expectWorktreeErrorWithCause(action: () => unknown, message: string): GitWorktreeError {
-  try {
-    action();
-    throw new Error("Expected GitWorktreeError.");
-  } catch (error) {
-    expect(error).toBeInstanceOf(GitWorktreeError);
-    expect((error as GitWorktreeError).message).toBe(message);
-    return error as GitWorktreeError;
   }
 }
 
@@ -72,6 +61,36 @@ function withGitShim<T>(shim: { path: string; cleanup(): void }, action: () => T
     process.env.PATH = previousPath;
     shim.cleanup();
   }
+}
+
+function createWorktreeAddShim(failExitCode: number = 128): { path: string; cleanup(): void } {
+  const dir = createTempDirectory("devflow-git-add-shim");
+  const realGitResult = spawnSync("sh", ["-lc", "command -v git"], { encoding: "utf8" });
+
+  if (realGitResult.status !== 0) {
+    dir.cleanup();
+    throw new Error("No se pudo localizar el binario real de git.");
+  }
+
+  const realGit = realGitResult.stdout.trim();
+  const scriptPath = join(dir.path, "git");
+  writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env bash
+if [ "$1" = "-C" ] && [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
+  exit ${failExitCode}
+fi
+exec ${JSON.stringify(realGit)} "$@"
+`,
+  );
+  chmodSync(scriptPath, 0o755);
+
+  return {
+    path: dir.path,
+    cleanup(): void {
+      dir.cleanup();
+    },
+  };
 }
 
 describe("git worktree service", () => {
@@ -599,6 +618,647 @@ describe("git worktree service", () => {
       expect(error.workspacePath).toBe("/workspace");
       expect(error.baseCommit).toBe("a".repeat(40));
       expect(error.cause).toBe(cause);
+    });
+  });
+
+  describe("createGitWorktree", () => {
+    describe("happy path", () => {
+      it("creates a worktree and returns normalized result", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          const result = createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            expect(result.repositoryRoot).toBe(repo.path);
+            expect(result.baseCommit).toBe(head.toLowerCase());
+            expect(result.branchName).toBe("devflow/project-a/TASK-001/execution-1");
+            expect(result.workspacePath).toBe(worktreePath);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("creates the expected branch", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const branchCheck = spawnSync("git", ["-C", repo.path, "show-ref", "--verify", "--quiet", "refs/heads/devflow/project-a/TASK-001/execution-1"], { encoding: "utf8", shell: false });
+            expect(branchCheck.status).toBe(0);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("HEAD of the worktree matches baseCommit", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const worktreeHead = spawnSync("git", ["-C", worktreePath, "rev-parse", "--verify", "HEAD"], { encoding: "utf8", shell: false }).stdout.trim().toLowerCase();
+            expect(worktreeHead).toBe(head.toLowerCase());
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("active branch matches branchName", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const branch = spawnSync("git", ["-C", worktreePath, "symbolic-ref", "--quiet", "--short", "HEAD"], { encoding: "utf8", shell: false }).stdout.trim();
+            expect(branch).toBe("devflow/project-a/TASK-001/execution-1");
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("worktree appears in worktree list --porcelain", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const list = repo.runGit(["worktree", "list", "--porcelain"]);
+            expect(list).toContain(`worktree ${worktreePath}`);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("main repository preserves its HEAD", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const headBefore = repo.runGit(["rev-parse", "HEAD"]);
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const headAfter = repo.runGit(["rev-parse", "HEAD"]);
+            expect(headAfter).toBe(headBefore);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("main repository preserves its branch", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const mainBranchBefore = repo.runGit(["branch", "--list", "main"]);
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const mainBranchAfter = repo.runGit(["branch", "--list", "main"]);
+            expect(mainBranchAfter).toBe(mainBranchBefore);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("main repository preserves its git status", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const diffBefore = repo.runGit(["diff", "HEAD"]);
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const diffAfter = repo.runGit(["diff", "HEAD"]);
+            expect(diffAfter).toBe(diffBefore);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+    });
+
+    describe("preflight reutilizado", () => {
+      it("rejects existing branch before creating", () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          repo.runGit(["branch", "devflow/project-a/TASK-001/execution-1"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          expectWorktreeError(
+            () => createGitWorktree({
+              repositoryRoot: repo.path,
+              baseCommit: head,
+              branchName: "devflow/project-a/TASK-001/execution-1",
+              workspacePath: worktreePath,
+            }),
+            "La rama ya existe: devflow/project-a/TASK-001/execution-1",
+          );
+        } finally {
+          repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          repo.cleanup();
+        }
+      });
+
+      it("rejects existing workspacePath before creating", () => {
+        const repo = createTempGitRepository();
+        const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          mkdirSync(worktreePath, { recursive: true });
+
+          expectWorktreeError(
+            () => createGitWorktree({
+              repositoryRoot: repo.path,
+              baseCommit: head,
+              branchName: "devflow/project-a/TASK-001/execution-1",
+              workspacePath: worktreePath,
+            }),
+            `La ruta del workspace ya existe: ${worktreePath}`,
+          );
+        } finally {
+          rmSync(worktreePath, { recursive: true, force: true });
+          repo.cleanup();
+        }
+      });
+
+      it("rejects invalid baseCommit", () => {
+        const repo = createTempGitRepository();
+        try {
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          expectWorktreeError(
+            () => createGitWorktree({
+              repositoryRoot: repo.path,
+              baseCommit: "abc1234",
+              branchName: "devflow/project-a/TASK-001/execution-1",
+              workspacePath: worktreePath,
+            }),
+            "El commit base no es un SHA hexadecimal minúsculo de 40 caracteres: abc1234",
+          );
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("does not create resources when preflight fails", () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          repo.runGit(["branch", "devflow/project-a/TASK-001/execution-1"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          try {
+            expectWorktreeError(
+              () => createGitWorktree({
+                repositoryRoot: repo.path,
+                baseCommit: head,
+                branchName: "devflow/project-a/TASK-001/execution-1",
+                workspacePath: worktreePath,
+              }),
+              "La rama ya existe: devflow/project-a/TASK-001/execution-1",
+            );
+
+            expect(existsSync(worktreePath)).toBe(false);
+          } finally {
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+    });
+
+    describe("errors", () => {
+      it("translates a git worktree add failure to GitWorktreeError", () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+          const shim = createWorktreeAddShim(128);
+
+          withGitShim(shim, () => {
+            expectWorktreeError(
+              () => createGitWorktree({
+                repositoryRoot: repo.path,
+                baseCommit: head,
+                branchName: "devflow/project-a/TASK-001/execution-1",
+                workspacePath: worktreePath,
+              }),
+              "Git devolvió un código de salida distinto de 0 al crear el worktree: " + repo.path,
+            );
+          });
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("preserves command and exitCode", () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+          const shim = createWorktreeAddShim(128);
+
+          withGitShim(shim, () => {
+            expectWorktreeError(
+              () => createGitWorktree({
+                repositoryRoot: repo.path,
+                baseCommit: head,
+                branchName: "devflow/project-a/TASK-001/execution-1",
+                workspacePath: worktreePath,
+              }),
+              "Git devolvió un código de salida distinto de 0 al crear el worktree: " + repo.path,
+            );
+          });
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("does not expose stderr in the public message", () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+          const shim = createWorktreeAddShim(128);
+
+          withGitShim(shim, () => {
+            expectWorktreeError(
+              () => createGitWorktree({
+                repositoryRoot: repo.path,
+                baseCommit: head,
+                branchName: "devflow/project-a/TASK-001/execution-1",
+                workspacePath: worktreePath,
+              }),
+              "Git devolvió un código de salida distinto de 0 al crear el worktree: " + repo.path,
+            );
+          });
+        } finally {
+          repo.cleanup();
+        }
+      });
+    });
+
+    describe("post-validation", () => {
+      it("confirms created path is a directory", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const stat = lstatSync(worktreePath);
+            expect(stat.isDirectory()).toBe(true);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("confirms correct HEAD", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const worktreeHead = spawnSync("git", ["-C", worktreePath, "rev-parse", "--verify", "HEAD"], { encoding: "utf8", shell: false }).stdout.trim().toLowerCase();
+            expect(worktreeHead).toBe(head.toLowerCase());
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("confirms correct branch", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const branch = spawnSync("git", ["-C", worktreePath, "symbolic-ref", "--quiet", "--short", "HEAD"], { encoding: "utf8", shell: false }).stdout.trim();
+            expect(branch).toBe("devflow/project-a/TASK-001/execution-1");
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("confirms correct registration", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const list = repo.runGit(["worktree", "list", "--porcelain"]);
+            expect(list).toContain(`worktree ${worktreePath}`);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+    });
+
+    describe("residues", () => {
+      it("does not execute git worktree remove on failure", () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+          const shim = createWorktreeAddShim(128);
+
+          withGitShim(shim, () => {
+            try {
+              createGitWorktree({
+                repositoryRoot: repo.path,
+                baseCommit: head,
+                branchName: "devflow/project-a/TASK-001/execution-1",
+                workspacePath: worktreePath,
+              });
+            } catch {
+              // expected
+            }
+          });
+
+          const worktreeList = repo.runGit(["worktree", "list"]);
+          expect(worktreeList).not.toContain("project-a");
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("does not execute git branch -D on failure", () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+          const branchesBefore = repo.runGit(["branch", "--list"]);
+          const shim = createWorktreeAddShim(128);
+
+          withGitShim(shim, () => {
+            try {
+              createGitWorktree({
+                repositoryRoot: repo.path,
+                baseCommit: head,
+                branchName: "devflow/project-a/TASK-001/execution-1",
+                workspacePath: worktreePath,
+              });
+            } catch {
+              // expected
+            }
+          });
+
+          const branchesAfter = repo.runGit(["branch", "--list"]);
+          expect(branchesAfter).toBe(branchesBefore);
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("does not remove pre-existing branch or path when preflight fails", () => {
+        const repo = createTempGitRepository();
+        const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          repo.runGit(["branch", "devflow/project-a/TASK-001/execution-1"]);
+          mkdirSync(worktreePath, { recursive: true });
+
+          try {
+            expectWorktreeError(
+              () => createGitWorktree({
+                repositoryRoot: repo.path,
+                baseCommit: head,
+                branchName: "devflow/project-a/TASK-001/execution-1",
+                workspacePath: worktreePath,
+              }),
+              "La rama ya existe: devflow/project-a/TASK-001/execution-1",
+            );
+          } catch {
+            // expected
+          }
+
+          expect(existsSync(worktreePath)).toBe(true);
+
+          const branchCheck = spawnSync("git", ["-C", repo.path, "show-ref", "--verify", "--quiet", "refs/heads/devflow/project-a/TASK-001/execution-1"], { encoding: "utf8", shell: false });
+          expect(branchCheck.status).toBe(0);
+        } finally {
+          rmSync(worktreePath, { recursive: true, force: true });
+          repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          repo.cleanup();
+        }
+      });
+    });
+
+    describe("isolation", () => {
+      it("does not access SQLite", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const dbFiles = spawnSync("find", [repo.path, "-name", "*.db", "-o", "-name", "*.sqlite"], { encoding: "utf8", shell: false }).stdout.trim();
+            expect(dbFiles).toBe("");
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("does not modify Task", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const diff = repo.runGit(["diff", "HEAD"]);
+            expect(diff).toBe("");
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
+
+      it("does not start Executor", async () => {
+        const repo = createTempGitRepository();
+        try {
+          const head = repo.runGit(["rev-parse", "HEAD"]);
+          const worktreePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+
+          createGitWorktree({
+            repositoryRoot: repo.path,
+            baseCommit: head,
+            branchName: "devflow/project-a/TASK-001/execution-1",
+            workspacePath: worktreePath,
+          });
+
+          try {
+            const executorCheck = spawnSync("pgrep", ["-f", "executor"], { encoding: "utf8", shell: false });
+            expect(executorCheck.status).not.toBe(0);
+          } finally {
+            repo.runGit(["worktree", "remove", worktreePath]);
+            repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+          }
+        } finally {
+          repo.cleanup();
+        }
+      });
     });
   });
 });

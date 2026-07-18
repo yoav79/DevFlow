@@ -408,3 +408,338 @@ export function preflightGitWorktree(input: GitWorktreePreflightInput): GitWorkt
     workspacePath,
   };
 }
+
+function isWorktreePathRegistered(repositoryRoot: string, workspacePath: string): boolean {
+  const result = runGitCommand(repositoryRoot, ["worktree", "list", "--porcelain"]);
+
+  if (result.status !== 0) {
+    return false;
+  }
+
+  const entries = parseWorktreeListPorcelain(repositoryRoot, result.stdout);
+
+  for (const entry of entries) {
+    if (resolve(entry.worktreePath) === workspacePath) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// createGitWorktree is the first write operation. The preflight does not prevent
+// race conditions; the Git command remains the authority. Residues are reported
+// and will be reconciled in a subsequent task.
+export function createGitWorktree(
+  input: GitWorktreePreflightInput,
+): GitWorktreePreflightResult {
+  const { repositoryRoot, baseCommit, branchName, workspacePath } =
+    preflightGitWorktree(input);
+
+  const command = `worktree add -b ${branchName} ${workspacePath} ${baseCommit}`;
+
+  const result = spawnSync(
+    "git",
+    [
+      "-C",
+      repositoryRoot,
+      "worktree",
+      "add",
+      "-b",
+      branchName,
+      workspacePath,
+      baseCommit,
+    ],
+    {
+      encoding: "utf8",
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+
+  if (result.error !== undefined) {
+    const originalError = result.error;
+
+    try {
+      const branchExists =
+        runGitCommand(repositoryRoot, [
+          "show-ref",
+          "--verify",
+          "--quiet",
+          `refs/heads/${branchName}`,
+        ]).status === 0;
+      const pathCreated = existsSync(workspacePath);
+      const worktreeRegistered = isWorktreePathRegistered(
+        repositoryRoot,
+        workspacePath,
+      );
+
+      if (branchExists || pathCreated || worktreeRegistered) {
+        throw new GitWorktreeError(
+          `Se detectó un estado residual tras fallar la creación del worktree: ${workspacePath}`,
+          {
+            repositoryRoot,
+            command,
+            branchName,
+            workspacePath,
+            baseCommit,
+            cause: originalError,
+          },
+        );
+      }
+    } catch (residueError) {
+      if (residueError instanceof GitWorktreeError) {
+        throw residueError;
+      }
+    }
+
+    throw new GitWorktreeError(
+      `No se pudo ejecutar Git para crear el worktree: ${repositoryRoot}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+        cause: originalError,
+      },
+    );
+  }
+
+  if (result.status !== 0) {
+    const exitCode = result.status;
+
+    try {
+      const branchExists =
+        runGitCommand(repositoryRoot, [
+          "show-ref",
+          "--verify",
+          "--quiet",
+          `refs/heads/${branchName}`,
+        ]).status === 0;
+      const pathCreated = existsSync(workspacePath);
+      const worktreeRegistered = isWorktreePathRegistered(
+        repositoryRoot,
+        workspacePath,
+      );
+
+      if (branchExists || pathCreated || worktreeRegistered) {
+        throw new GitWorktreeError(
+          `Se detectó un estado residual tras fallar la creación del worktree: ${workspacePath}`,
+          {
+            repositoryRoot,
+            command,
+            exitCode,
+            branchName,
+            workspacePath,
+            baseCommit,
+          },
+        );
+      }
+    } catch (residueError) {
+      if (residueError instanceof GitWorktreeError) {
+        throw residueError;
+      }
+    }
+
+    throw new GitWorktreeError(
+      `Git devolvió un código de salida distinto de 0 al crear el worktree: ${repositoryRoot}`,
+      {
+        repositoryRoot,
+        command,
+        exitCode,
+        branchName,
+        workspacePath,
+        baseCommit,
+      },
+    );
+  }
+
+  try {
+    const stat = lstatSync(workspacePath);
+
+    if (!stat.isDirectory()) {
+      throw new GitWorktreeError(
+        `La ruta del worktree no es un directorio: ${workspacePath}`,
+        {
+          repositoryRoot,
+          command,
+          branchName,
+          workspacePath,
+          baseCommit,
+        },
+      );
+    }
+  } catch (error) {
+    if (error instanceof GitWorktreeError) {
+      throw error;
+    }
+
+    throw new GitWorktreeError(
+      `La ruta del worktree no fue creada: ${workspacePath}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+        cause: error,
+      },
+    );
+  }
+
+  if (!isWorktreePathRegistered(repositoryRoot, workspacePath)) {
+    throw new GitWorktreeError(
+      `El worktree no está registrado en el repositorio: ${workspacePath}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+      },
+    );
+  }
+
+  const headResult = spawnSync(
+    "git",
+    ["-C", workspacePath, "rev-parse", "--verify", "HEAD"],
+    {
+      encoding: "utf8",
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+
+  if (headResult.error !== undefined) {
+    throw new GitWorktreeError(
+      `No se pudo ejecutar Git para validar el worktree creado: ${workspacePath}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+        cause: headResult.error,
+      },
+    );
+  }
+
+  if (headResult.status !== 0) {
+    throw new GitWorktreeError(
+      `Git devolvió una salida inválida al validar el worktree creado: ${repositoryRoot}`,
+      {
+        repositoryRoot,
+        command,
+        exitCode: headResult.status,
+        branchName,
+        workspacePath,
+        baseCommit,
+      },
+    );
+  }
+
+  const worktreeHead = headResult.stdout.trim().toLowerCase();
+
+  if (!COMMIT_SHA_PATTERN.test(worktreeHead)) {
+    throw new GitWorktreeError(
+      `Git devolvió una salida inválida al validar el worktree creado: ${repositoryRoot}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+      },
+    );
+  }
+
+  if (worktreeHead !== baseCommit) {
+    throw new GitWorktreeError(
+      `El HEAD del worktree no coincide con el commit base: ${workspacePath}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+      },
+    );
+  }
+
+  const branchResult = spawnSync(
+    "git",
+    ["-C", workspacePath, "symbolic-ref", "--quiet", "--short", "HEAD"],
+    {
+      encoding: "utf8",
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+
+  if (branchResult.error !== undefined) {
+    throw new GitWorktreeError(
+      `No se pudo ejecutar Git para validar el worktree creado: ${workspacePath}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+        cause: branchResult.error,
+      },
+    );
+  }
+
+  if (branchResult.status !== 0) {
+    throw new GitWorktreeError(
+      `Git devolvió una salida inválida al validar el worktree creado: ${repositoryRoot}`,
+      {
+        repositoryRoot,
+        command,
+        exitCode: branchResult.status,
+        branchName,
+        workspacePath,
+        baseCommit,
+      },
+    );
+  }
+
+  const worktreeBranch = branchResult.stdout.trim();
+
+  if (worktreeBranch.length === 0) {
+    throw new GitWorktreeError(
+      `Git devolvió una salida inválida al validar el worktree creado: ${repositoryRoot}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+      },
+    );
+  }
+
+  if (worktreeBranch !== branchName) {
+    throw new GitWorktreeError(
+      `La rama del worktree no coincide con la rama esperada: ${workspacePath}`,
+      {
+        repositoryRoot,
+        command,
+        branchName,
+        workspacePath,
+        baseCommit,
+      },
+    );
+  }
+
+  return {
+    repositoryRoot,
+    baseCommit,
+    branchName,
+    workspacePath,
+  };
+}
