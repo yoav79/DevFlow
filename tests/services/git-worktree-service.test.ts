@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { createTempDirectory } from "../helpers/temp-directory.js";
 import { createTempGitRepository } from "../helpers/temp-git-repository.js";
-import { createGitWorktree, GitWorktreeError, preflightGitWorktree } from "../../src/services/git-worktree-service.js";
+import { createGitWorktree, GitWorktreeError, inspectGitWorktreeState, preflightGitWorktree } from "../../src/services/git-worktree-service.js";
 
 function expectWorktreeError(action: () => unknown, message: string): void {
   try {
@@ -1259,6 +1259,509 @@ describe("git worktree service", () => {
           repo.cleanup();
         }
       });
+    });
+  });
+});
+
+describe("inspectGitWorktreeState", () => {
+  function expectWorktreeInspectionError(action: () => unknown, message: string): void {
+    try {
+      action();
+      throw new Error("Expected GitWorktreeError.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(GitWorktreeError);
+      expect((error as GitWorktreeError).message).toBe(message);
+    }
+  }
+
+  describe("CLEAN", () => {
+    it("returns CLEAN when no branch, path, or registration exists", () => {
+      const repo = createTempGitRepository();
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        const workspacePath = join(repo.path, "worktrees", "nonexistent", "task", "1");
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "devflow/project-a/TASK-001/execution-1",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("CLEAN");
+        expect(result.branchExists).toBe(false);
+        expect(result.pathKind).toBe("MISSING");
+        expect(result.worktreeRegistered).toBe(false);
+        expect(result.headMatchesBaseCommit).toBeNull();
+        expect(result.branchMatchesExpected).toBeNull();
+        expect(result.detached).toBeNull();
+        expect(result.locked).toBe(false);
+        expect(result.prunable).toBe(false);
+      } finally {
+        repo.cleanup();
+      }
+    });
+  });
+
+  describe("RECOVERABLE", () => {
+    it("branch only", () => {
+      const repo = createTempGitRepository();
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        repo.runGit(["branch", "devflow/project-a/TASK-001/execution-1"]);
+        const workspacePath = join(repo.path, "worktrees", "nonexistent", "task", "1");
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "devflow/project-a/TASK-001/execution-1",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("RECOVERABLE");
+        expect(result.branchExists).toBe(true);
+        expect(result.pathKind).toBe("MISSING");
+        expect(result.worktreeRegistered).toBe(false);
+      } finally {
+        repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+        repo.cleanup();
+      }
+    });
+
+    it("directory only", () => {
+      const repo = createTempGitRepository();
+      const workspacePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        mkdirSync(workspacePath, { recursive: true });
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "devflow/project-a/TASK-001/execution-1",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("RECOVERABLE");
+        expect(result.branchExists).toBe(false);
+        expect(result.pathKind).toBe("DIRECTORY");
+        expect(result.worktreeRegistered).toBe(false);
+      } finally {
+        rmSync(workspacePath, { recursive: true, force: true });
+        repo.cleanup();
+      }
+    });
+
+    it("branch + directory without registration", () => {
+      const repo = createTempGitRepository();
+      const workspacePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        repo.runGit(["branch", "devflow/project-a/TASK-001/execution-1"]);
+        mkdirSync(workspacePath, { recursive: true });
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "devflow/project-a/TASK-001/execution-1",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("RECOVERABLE");
+        expect(result.branchExists).toBe(true);
+        expect(result.pathKind).toBe("DIRECTORY");
+        expect(result.worktreeRegistered).toBe(false);
+      } finally {
+        rmSync(workspacePath, { recursive: true, force: true });
+        repo.runGit(["branch", "-D", "devflow/project-a/TASK-001/execution-1"]);
+        repo.cleanup();
+      }
+    });
+
+    it("prunable worktree", () => {
+      const repo = createTempGitRepository();
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        const workspacePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+        repo.runGit(["worktree", "add", workspacePath, "HEAD"]);
+        rmSync(workspacePath, { recursive: true, force: true });
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "main",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("RECOVERABLE");
+        expect(result.worktreeRegistered).toBe(true);
+        expect(result.prunable).toBe(true);
+        expect(result.pathKind).toBe("MISSING");
+      } finally {
+        repo.cleanup();
+      }
+    });
+  });
+
+  describe("MANUAL_INTERVENTION", () => {
+    it("file path", () => {
+      const repo = createTempGitRepository();
+      const workspacePath = join(repo.path, "worktrees", "project-a", "TASK-001", "1");
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        mkdirSync(join(repo.path, "worktrees", "project-a", "TASK-001"), { recursive: true });
+        writeFileSync(workspacePath, "content");
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "devflow/project-a/TASK-001/execution-1",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("MANUAL_INTERVENTION");
+        expect(result.pathKind).toBe("FILE");
+      } finally {
+        rmSync(workspacePath, { force: true });
+        rmSync(join(repo.path, "worktrees", "project-a"), { recursive: true, force: true });
+        repo.cleanup();
+      }
+    });
+
+    it("symlink path", () => {
+      const repo = createTempGitRepository();
+      const tempDir = createTempDirectory("devflow-inspect-symlink");
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        const target = join(tempDir.path, "target");
+        const workspacePath = join(tempDir.path, "workspace-link");
+        mkdirSync(target);
+        symlinkSync(target, workspacePath);
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "devflow/project-a/TASK-001/execution-1",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("MANUAL_INTERVENTION");
+        expect(result.pathKind).toBe("SYMLINK");
+      } finally {
+        tempDir.cleanup();
+        repo.cleanup();
+      }
+    });
+
+    it("locked worktree", () => {
+      const repo = createTempGitRepository();
+      const tempDir = createTempDirectory("devflow-inspect-locked");
+      const workspacePath = join(tempDir.path, "locked-worktree");
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        repo.runGit(["worktree", "add", workspacePath, "HEAD"]);
+        repo.runGit(["worktree", "lock", workspacePath]);
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "main",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("MANUAL_INTERVENTION");
+        expect(result.locked).toBe(true);
+      } finally {
+        repo.runGit(["worktree", "unlock", workspacePath]);
+        repo.runGit(["worktree", "remove", workspacePath, "--force"]);
+        tempDir.cleanup();
+        repo.cleanup();
+      }
+    });
+  });
+
+  describe("COMPLETE", () => {
+    it("returns COMPLETE for a fully correct worktree", () => {
+      const repo = createTempGitRepository();
+      const tempDir = createTempDirectory("devflow-inspect-complete");
+      const workspacePath = join(tempDir.path, "complete-worktree");
+      const branchName = "devflow/project-a/TASK-001/execution-1";
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        repo.runGit(["worktree", "add", "-b", branchName, workspacePath, "HEAD"]);
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName,
+          workspacePath,
+        });
+
+        expect(result.state).toBe("COMPLETE");
+        expect(result.branchExists).toBe(true);
+        expect(result.pathKind).toBe("DIRECTORY");
+        expect(result.worktreeRegistered).toBe(true);
+        expect(result.headMatchesBaseCommit).toBe(true);
+        expect(result.branchMatchesExpected).toBe(true);
+        expect(result.detached).toBe(false);
+        expect(result.locked).toBe(false);
+        expect(result.prunable).toBe(false);
+      } finally {
+        repo.runGit(["worktree", "remove", workspacePath, "--force"]);
+        repo.runGit(["branch", "-D", branchName]);
+        tempDir.cleanup();
+        repo.cleanup();
+      }
+    });
+  });
+
+  describe("INCONSISTENT", () => {
+    it("HEAD mismatch", () => {
+      const repo = createTempGitRepository();
+      const tempDir = createTempDirectory("devflow-inspect-head-mismatch");
+      const workspacePath = join(tempDir.path, "head-mismatch");
+      const branchName = "devflow/project-a/TASK-001/execution-1";
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        repo.runGit(["worktree", "add", "-b", branchName, workspacePath, "HEAD"]);
+
+        writeFileSync(join(workspacePath, "new-file.txt"), "content");
+        repo.runGit(["-C", workspacePath, "add", "new-file.txt"]);
+        repo.runGit(["-C", workspacePath, "commit", "-m", "second commit"]);
+        const newHead = repo.runGit(["-C", workspacePath, "rev-parse", "HEAD"]);
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName,
+          workspacePath,
+        });
+
+        expect(result.state).toBe("INCONSISTENT");
+        expect(result.headMatchesBaseCommit).toBe(false);
+      } finally {
+        repo.runGit(["worktree", "remove", workspacePath, "--force"]);
+        repo.runGit(["branch", "-D", branchName]);
+        tempDir.cleanup();
+        repo.cleanup();
+      }
+    });
+
+    it("branch mismatch", () => {
+      const repo = createTempGitRepository();
+      const tempDir = createTempDirectory("devflow-inspect-branch-mismatch");
+      const workspacePath = join(tempDir.path, "branch-mismatch");
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        repo.runGit(["worktree", "add", workspacePath, "HEAD"]);
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "devflow/project-a/TASK-001/execution-1",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("INCONSISTENT");
+        expect(result.branchMatchesExpected).toBe(false);
+      } finally {
+        repo.runGit(["worktree", "remove", workspacePath, "--force"]);
+        tempDir.cleanup();
+        repo.cleanup();
+      }
+    });
+
+    it("detached worktree", () => {
+      const repo = createTempGitRepository();
+      const tempDir = createTempDirectory("devflow-inspect-detached");
+      const workspacePath = join(tempDir.path, "detached-worktree");
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        repo.runGit(["worktree", "add", "--detach", workspacePath, "HEAD"]);
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "main",
+          workspacePath,
+        });
+
+        expect(result.state).toBe("INCONSISTENT");
+        expect(result.detached).toBe(true);
+      } finally {
+        repo.runGit(["worktree", "remove", workspacePath, "--force"]);
+        tempDir.cleanup();
+        repo.cleanup();
+      }
+    });
+
+    it("similar path does not count as registration", () => {
+      const repo = createTempGitRepository();
+      const tempDir = createTempDirectory("devflow-inspect-prefix");
+      const worktreePath = join(tempDir.path, "workspace");
+      const prefixPath = `${worktreePath}-other`;
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        repo.runGit(["worktree", "add", worktreePath, "HEAD"]);
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "main",
+          workspacePath: prefixPath,
+        });
+
+        expect(result.worktreeRegistered).toBe(false);
+        expect(result.pathKind).toBe("MISSING");
+      } finally {
+        repo.runGit(["worktree", "remove", worktreePath, "--force"]);
+        tempDir.cleanup();
+        repo.cleanup();
+      }
+    });
+
+    it("registered without physical path when not prunable", () => {
+      const repo = createTempGitRepository();
+      const tempDir = createTempDirectory("devflow-inspect-registered-no-path");
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        const workspacePath = join(tempDir.path, "registered-only");
+        repo.runGit(["worktree", "add", workspacePath, "HEAD"]);
+        rmSync(workspacePath, { recursive: true, force: true });
+
+        const worktreeList = repo.runGit(["worktree", "list", "--porcelain"]);
+        const isPrunable = worktreeList.includes("prunable");
+
+        const result = inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "main",
+          workspacePath,
+        });
+
+        if (!isPrunable) {
+          expect(result.state).toBe("INCONSISTENT");
+          expect(result.worktreeRegistered).toBe(true);
+          expect(result.pathKind).toBe("MISSING");
+        }
+      } finally {
+        repo.runGit(["worktree", "prune"]);
+        tempDir.cleanup();
+        repo.cleanup();
+      }
+    });
+  });
+
+  describe("errors", () => {
+    it("rejects invalid repositoryRoot", () => {
+      const repo = createTempGitRepository();
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        const workspacePath = join(repo.path, "worktrees", "nonexistent", "task", "1");
+
+        expectWorktreeInspectionError(
+          () => inspectGitWorktreeState({
+            repositoryRoot: "/tmp/devflow-nonexistent-repo-12345",
+            baseCommit: head.toLowerCase(),
+            branchName: "main",
+            workspacePath,
+          }),
+          `No existe la ruta del repositorio: /tmp/devflow-nonexistent-repo-12345`,
+        );
+      } finally {
+        repo.cleanup();
+      }
+    });
+
+    it("rejects invalid baseCommit format", () => {
+      const repo = createTempGitRepository();
+      try {
+        const workspacePath = join(repo.path, "worktrees", "nonexistent", "task", "1");
+
+        expectWorktreeInspectionError(
+          () => inspectGitWorktreeState({
+            repositoryRoot: repo.path,
+            baseCommit: "abc1234",
+            branchName: "main",
+            workspacePath,
+          }),
+          "El commit base no es un SHA hexadecimal minúsculo de 40 caracteres: abc1234",
+        );
+      } finally {
+        repo.cleanup();
+      }
+    });
+
+    it("rejects malformed porcelain output", () => {
+      const repo = createTempGitRepository();
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        const shim = createGitShim({ worktreeListOutput: "garbage\n" });
+        const workspacePath = join(repo.path, "worktrees", "nonexistent", "task", "1");
+
+        withGitShim(shim, () => {
+          expectWorktreeInspectionError(
+            () => inspectGitWorktreeState({
+              repositoryRoot: repo.path,
+              baseCommit: head.toLowerCase(),
+              branchName: "main",
+              workspacePath,
+            }),
+            `Git devolvió una salida inválida al inspeccionar el estado del worktree: ${repo.path}`,
+          );
+        });
+      } finally {
+        repo.cleanup();
+      }
+    });
+  });
+
+  describe("isolation", () => {
+    it("does not modify HEAD, branch, status, or create paths", () => {
+      const repo = createTempGitRepository();
+      try {
+        const headBefore = repo.runGit(["rev-parse", "HEAD"]);
+        const branchesBefore = repo.runGit(["branch", "--list"]);
+        const statusBefore = repo.runGit(["status", "--short"]);
+        const worktreesBefore = repo.runGit(["worktree", "list", "--porcelain"]);
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        const workspacePath = join(repo.path, "worktrees", "nonexistent", "task", "1");
+
+        inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "main",
+          workspacePath,
+        });
+
+        expect(repo.runGit(["rev-parse", "HEAD"])).toBe(headBefore);
+        expect(repo.runGit(["branch", "--list"])).toBe(branchesBefore);
+        expect(repo.runGit(["status", "--short"])).toBe(statusBefore);
+        expect(repo.runGit(["worktree", "list", "--porcelain"])).toBe(worktreesBefore);
+        expect(existsSync(workspacePath)).toBe(false);
+      } finally {
+        repo.cleanup();
+      }
+    });
+
+    it("does not access SQLite", () => {
+      const repo = createTempGitRepository();
+      try {
+        const head = repo.runGit(["rev-parse", "HEAD"]);
+        const workspacePath = join(repo.path, "worktrees", "nonexistent", "task", "1");
+
+        inspectGitWorktreeState({
+          repositoryRoot: repo.path,
+          baseCommit: head.toLowerCase(),
+          branchName: "main",
+          workspacePath,
+        });
+
+        const dbFiles = spawnSync("find", [repo.path, "-name", "*.db", "-o", "-name", "*.sqlite"], { encoding: "utf8", shell: false }).stdout.trim();
+        expect(dbFiles).toBe("");
+      } finally {
+        repo.cleanup();
+      }
     });
   });
 });
