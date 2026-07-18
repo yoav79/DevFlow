@@ -1,36 +1,55 @@
 /// <reference types="node" />
 
 import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
+import { existsSync, lstatSync } from "node:fs";
 
-export interface GitInspectionResult {
-  readonly isGitRepository: boolean;
-  readonly gitDirectoryPath: string | null;
-  readonly isHeadPresent: boolean;
+export interface GitRepositoryInspection {
+  readonly repositoryRoot: string;
+  readonly baseCommit: string;
 }
 
 export class GitInspectionError extends Error {
-  readonly field?: string;
-  readonly value?: unknown;
+  readonly repositoryPath: string;
+  readonly command?: string;
+  readonly exitCode?: number | null;
 
   constructor(
     message: string,
-    options?: { field?: string; value?: unknown; cause?: unknown },
+    options: {
+      repositoryPath: string;
+      command?: string;
+      exitCode?: number | null;
+      cause?: unknown;
+    },
   ) {
     super(message);
     this.name = "GitInspectionError";
-    this.field = options?.field;
-    this.value = options?.value;
-    if (options?.cause !== undefined) {
+    this.repositoryPath = options.repositoryPath;
+    this.command = options.command;
+    this.exitCode = options.exitCode;
+    if (options.cause !== undefined) {
       this.cause = options.cause;
     }
   }
 }
 
-function runGitCommand(repositoryPath: string, args: string[]): { stdout: string; stderr: string; status: number | null } {
-  const result = spawnSync("git", args, {
-    cwd: repositoryPath,
+const HEAD_COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+
+function runGitCommand(resolvedPath: string, args: string[]): { stdout: string; stderr: string; status: number | null } {
+  const result = spawnSync("git", ["-C", resolvedPath, ...args], {
     encoding: "utf8",
+    shell: false,
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"],
   });
+
+  if (result.error !== undefined) {
+    throw new GitInspectionError(
+      `No se pudo ejecutar Git para inspeccionar el repositorio: ${resolvedPath}`,
+      { repositoryPath: resolvedPath, command: args.join(" "), cause: result.error },
+    );
+  }
 
   return {
     stdout: (result.stdout ?? "").trim(),
@@ -39,36 +58,69 @@ function runGitCommand(repositoryPath: string, args: string[]): { stdout: string
   };
 }
 
-export function inspectGitRepository(repositoryPath: string): GitInspectionResult {
-  if (typeof repositoryPath !== "string") {
+export function inspectGitRepository(repositoryPath: string): GitRepositoryInspection {
+  const trimmed = repositoryPath.trim();
+
+  if (trimmed.length === 0) {
     throw new GitInspectionError(
-      "El repositoryPath debe ser una cadena de texto.",
-      { field: "repositoryPath", value: repositoryPath },
+      "La ruta del repositorio no puede estar vacía.",
+      { repositoryPath },
     );
   }
 
-  if (repositoryPath.trim().length === 0) {
+  const resolvedPath = resolve(trimmed);
+
+  if (!existsSync(resolvedPath)) {
     throw new GitInspectionError(
-      "El repositoryPath no puede estar vacío.",
-      { field: "repositoryPath", value: repositoryPath },
+      `No existe la ruta del repositorio: ${resolvedPath}`,
+      { repositoryPath: resolvedPath },
     );
   }
 
-  const gitDirResult = runGitCommand(repositoryPath, ["rev-parse", "--git-dir"]);
+  const stat = lstatSync(resolvedPath);
 
-  if (gitDirResult.status !== 0) {
-    return {
-      isGitRepository: false,
-      gitDirectoryPath: null,
-      isHeadPresent: false,
-    };
+  if (!stat.isDirectory()) {
+    throw new GitInspectionError(
+      `La ruta del repositorio no es un directorio: ${resolvedPath}`,
+      { repositoryPath: resolvedPath },
+    );
   }
 
-  const headResult = runGitCommand(repositoryPath, ["rev-parse", "--verify", "HEAD"]);
+  const rootResult = runGitCommand(resolvedPath, ["rev-parse", "--show-toplevel"]);
 
-  return {
-    isGitRepository: true,
-    gitDirectoryPath: gitDirResult.stdout,
-    isHeadPresent: headResult.status === 0,
-  };
+  if (rootResult.status !== 0) {
+    throw new GitInspectionError(
+      `La ruta no corresponde a un repositorio Git válido: ${resolvedPath}`,
+      { repositoryPath: resolvedPath, command: "rev-parse --show-toplevel", exitCode: rootResult.status },
+    );
+  }
+
+  if (rootResult.stdout.length === 0) {
+    throw new GitInspectionError(
+      `Git no devolvió la raíz del repositorio: ${resolvedPath}`,
+      { repositoryPath: resolvedPath, command: "rev-parse --show-toplevel", exitCode: rootResult.status },
+    );
+  }
+
+  const repositoryRoot = resolve(rootResult.stdout);
+
+  const commitResult = runGitCommand(repositoryRoot, ["rev-parse", "--verify", "HEAD"]);
+
+  if (commitResult.status !== 0) {
+    throw new GitInspectionError(
+      `El repositorio no tiene un commit HEAD válido: ${repositoryRoot}`,
+      { repositoryPath: resolvedPath, command: "rev-parse --verify HEAD", exitCode: commitResult.status },
+    );
+  }
+
+  const baseCommit = commitResult.stdout.toLowerCase();
+
+  if (!HEAD_COMMIT_PATTERN.test(baseCommit)) {
+    throw new GitInspectionError(
+      `Git devolvió un commit base inválido para el repositorio: ${repositoryRoot}`,
+      { repositoryPath: resolvedPath, command: "rev-parse --verify HEAD", exitCode: commitResult.status },
+    );
+  }
+
+  return { repositoryRoot, baseCommit };
 }
