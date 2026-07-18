@@ -80,6 +80,43 @@ function rollback(database: DatabaseSync): void {
   }
 }
 
+function markWorkspaceFailed(
+  database: DatabaseSync,
+  workspaceId: string,
+): void {
+  try {
+    beginImmediate(database);
+
+    const workspace = getTaskWorkspaceById(database, workspaceId);
+
+    if (workspace === null) {
+      rollback(database);
+      return;
+    }
+
+    if (workspace.status === "FAILED") {
+      commit(database);
+      return;
+    }
+
+    if (workspace.status === "REMOVED") {
+      rollback(database);
+      return;
+    }
+
+    try {
+      updateTaskWorkspaceStatus(database, workspaceId, "FAILED");
+    } catch {
+      rollback(database);
+      return;
+    }
+
+    commit(database);
+  } catch {
+    rollback(database);
+  }
+}
+
 export function createTaskWorkspaceForExecution(
   database: DatabaseSync,
   taskId: string,
@@ -323,6 +360,8 @@ export function createTaskWorkspaceForExecution(
       workspacePath,
     });
   } catch (error) {
+    markWorkspaceFailed(database, workspaceId);
+
     throw new WorkspaceCreationError(
       `No se pudo crear el worktree del workspace ${workspaceId}.`,
       {
@@ -337,6 +376,8 @@ export function createTaskWorkspaceForExecution(
 
   beginImmediate(database);
 
+  let failurePhase: WorkspaceCreationPhase = "MARK_READY";
+
   try {
     let updatedWorkspace: TaskWorkspace;
 
@@ -349,7 +390,7 @@ export function createTaskWorkspaceForExecution(
           taskId: normalizedTaskId,
           projectId: task.projectId,
           workspaceId,
-          phase: "MARK_READY",
+          phase: failurePhase,
           cause: error,
         },
       );
@@ -362,10 +403,12 @@ export function createTaskWorkspaceForExecution(
           taskId: normalizedTaskId,
           projectId: task.projectId,
           workspaceId,
-          phase: "MARK_READY",
+          phase: failurePhase,
         },
       );
     }
+
+    failurePhase = "MARK_EXECUTING";
 
     const now = new Date().toISOString();
     const updatedTask = updateTaskState(database, task.id, "EXECUTING", now);
@@ -377,7 +420,7 @@ export function createTaskWorkspaceForExecution(
           taskId: normalizedTaskId,
           projectId: task.projectId,
           workspaceId,
-          phase: "MARK_EXECUTING",
+          phase: failurePhase,
         },
       );
     }
@@ -385,6 +428,8 @@ export function createTaskWorkspaceForExecution(
     commit(database);
   } catch (error) {
     rollback(database);
+
+    markWorkspaceFailed(database, workspaceId);
 
     if (error instanceof WorkspaceCreationError) {
       throw error;
@@ -396,7 +441,7 @@ export function createTaskWorkspaceForExecution(
         taskId: normalizedTaskId,
         projectId: task.projectId,
         workspaceId,
-        phase: "MARK_READY",
+        phase: failurePhase,
         cause: error,
       },
     );
