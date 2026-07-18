@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createProject } from "../../src/repositories/project-repository.js";
 import { createTask, getTaskById } from "../../src/repositories/task-repository.js";
@@ -12,6 +12,7 @@ import {
   updateTaskWorkspaceStatus,
 } from "../../src/repositories/task-workspace-repository.js";
 import { createTempDatabase, type TempDatabase } from "../helpers/temp-database.js";
+import { createTempDirectory, type TempDirectory } from "../helpers/temp-directory.js";
 import { createTempGitRepository } from "../helpers/temp-git-repository.js";
 import type { TempGitRepository } from "../helpers/temp-git-repository.js";
 import {
@@ -73,41 +74,61 @@ function getGitHead(repoPath: string): string {
 
 describe("workspace creation service", () => {
   let tempDb: TempDatabase | null = null;
+  let tempHome: TempDirectory | null = null;
   let repo: TempGitRepository | null = null;
+  let previousHome: string | undefined;
+
+  beforeEach(() => {
+    previousHome = process.env.HOME;
+    tempHome = createTempDirectory("devflow-workspace-test");
+    process.env.HOME = tempHome.path;
+  });
 
   afterEach(() => {
-    if (repo !== null) {
-      try {
-        const worktreeList = getGitWorktreeList(repo.path);
-        const blocks = worktreeList.split("\n\n").filter((b) => b.trim().length > 0);
-        for (const block of blocks) {
-          const worktreeMatch = block.match(/^worktree (.+)$/m);
-          const worktreePath = worktreeMatch?.[1];
-          if (worktreePath !== undefined && worktreePath !== repo.path) {
-            spawnSync("git", ["-C", repo.path, "worktree", "remove", worktreePath, "--force"], {
-              encoding: "utf8",
-            });
+    try {
+      if (repo !== null) {
+        try {
+          const worktreeList = getGitWorktreeList(repo.path);
+          const blocks = worktreeList.split("\n\n").filter((b) => b.trim().length > 0);
+          for (const block of blocks) {
+            const worktreeMatch = block.match(/^worktree (.+)$/m);
+            const worktreePath = worktreeMatch?.[1];
+            if (worktreePath !== undefined && worktreePath !== repo.path) {
+              spawnSync("git", ["-C", repo.path, "worktree", "remove", worktreePath, "--force"], {
+                encoding: "utf8",
+              });
+            }
           }
+
+          const branchList = repo.runGit(["branch", "--list"]);
+          const branches = branchList
+            .split("\n")
+            .map((b) => b.replace(/^\*?\s+/, "").trim())
+            .filter((b) => b.length > 0 && b !== "main");
+          for (const branch of branches) {
+            repo.runGit(["branch", "-D", branch]);
+          }
+        } catch {
+          // Cleanup is best-effort.
         }
 
-        const branchList = repo.runGit(["branch", "--list"]);
-        const branches = branchList
-          .split("\n")
-          .map((b) => b.replace(/^\*?\s+/, "").trim())
-          .filter((b) => b.length > 0 && b !== "main");
-        for (const branch of branches) {
-          repo.runGit(["branch", "-D", branch]);
-        }
-      } catch {
-        // Cleanup is best-effort.
+        repo.cleanup();
+        repo = null;
+      }
+    } finally {
+      tempDb?.cleanup();
+      tempDb = null;
+
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
       }
 
-      repo.cleanup();
-      repo = null;
+      tempHome?.cleanup();
+      tempHome = null;
+      previousHome = undefined;
     }
-
-    tempDb?.cleanup();
-    tempDb = null;
   });
 
   describe("happy path", () => {
