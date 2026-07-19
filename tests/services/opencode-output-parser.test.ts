@@ -4,8 +4,8 @@ import { describe, it, expect } from "vitest";
 import {
   parseOpenCodeOutput,
   OpenCodeOutputParseError,
-  type OpenCodeProcessResult,
 } from "../../src/services/opencode-output-parser.js";
+import type { OpenCodeProcessResult } from "../../src/services/opencode-process-runner.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
