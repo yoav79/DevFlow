@@ -1,136 +1,219 @@
 import type { OpenCodeProcessResult } from "./opencode-process-runner.js";
 import {
   parseOpenCodeOutput,
-  type ParsedOpenCodeOutput,
+  OpenCodeOutputParseError,
 } from "./opencode-output-parser.js";
 import {
   parseAgentEnvelope,
-  assertAgentEnvelopeRole,
-  type AgentEnvelope,
+  AgentProtocolParseError,
 } from "./agent-protocol.js";
 import {
-  parseSupervisorPayload,
-  toSupervisorResult,
-  type SupervisorAgentPayload,
+  parseSupervisorAgentResult,
+  SupervisorPayloadValidationError,
+  SupervisorPayloadSemanticError,
 } from "./supervisor-agent-payload.js";
-import {
-  validateSupervisorResultSemantics,
-} from "./supervisor-result-semantic-validator.js";
 import type { SupervisorResult } from "../types.js";
 
-// ---------------------------------------------------------------------------
-// Result type
-// ---------------------------------------------------------------------------
+const STDERR_PREVIEW_MAX_CHARS = 400;
 
-export interface SupervisorIntegrationResult {
+export interface SupervisorOpenCodeInterpretation {
   readonly supervisorResult: SupervisorResult;
-  readonly parsedOutput: ParsedOpenCodeOutput;
-  readonly envelope: AgentEnvelope;
-  readonly payload: SupervisorAgentPayload;
+  readonly sessionID: string | null;
+  readonly messageID: string;
 }
 
-// ---------------------------------------------------------------------------
-// Error types
-// ---------------------------------------------------------------------------
-
-export type SupervisorIntegrationErrorCode =
+export type SupervisorOpenCodeInterpretationErrorCode =
+  | "PROCESS_EXIT_NOT_ZERO"
+  | "PROCESS_EXIT_UNKNOWN"
+  | "PROCESS_SIGNALED"
   | "OUTPUT_PARSE_FAILED"
-  | "ENVELOPE_PARSE_FAILED"
+  | "OUTPUT_NOT_FINISHED"
+  | "PROTOCOL_PARSE_FAILED"
   | "ROLE_MISMATCH"
-  | "PAYLOAD_PARSE_FAILED"
-  | "SEMANTIC_VALIDATION_FAILED";
+  | "AGENT_STATUS_NOT_ACCEPTED"
+  | "SUPERVISOR_PAYLOAD_INVALID"
+  | "SUPERVISOR_PAYLOAD_SEMANTIC_ERROR";
 
-export class SupervisorIntegrationError extends Error {
-  readonly code: SupervisorIntegrationErrorCode;
-  readonly cause: unknown;
+export class SupervisorOpenCodeInterpretationError extends Error {
+  readonly code: SupervisorOpenCodeInterpretationErrorCode;
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly hasStderr: boolean;
+  readonly stderrTruncated: boolean;
+  readonly stderrPreview?: string;
+  declare readonly cause?: unknown;
 
   constructor(
     message: string,
     options: {
-      code: SupervisorIntegrationErrorCode;
-      cause: unknown;
+      code: SupervisorOpenCodeInterpretationErrorCode;
+      result: OpenCodeProcessResult;
+      cause?: unknown;
     },
   ) {
     super(message);
-    this.name = "SupervisorIntegrationError";
+    this.name = "SupervisorOpenCodeInterpretationError";
     this.code = options.code;
-    this.cause = options.cause;
+    this.exitCode = options.result.exitCode;
+    this.signal = options.result.signal;
+    this.hasStderr = options.result.stderr.length > 0;
+    this.stderrTruncated = options.result.stderrTruncated;
+
+    if (this.hasStderr) {
+      this.stderrPreview = options.result.stderr.slice(0, STDERR_PREVIEW_MAX_CHARS);
+    }
+
+    if (options.cause !== undefined) {
+      this.cause = options.cause;
+    }
   }
 }
 
-// ---------------------------------------------------------------------------
-// Integration pipeline
-// ---------------------------------------------------------------------------
+function toInterpretationError(
+  message: string,
+  code: SupervisorOpenCodeInterpretationErrorCode,
+  result: OpenCodeProcessResult,
+  cause?: unknown,
+): SupervisorOpenCodeInterpretationError {
+  return new SupervisorOpenCodeInterpretationError(message, {
+    code,
+    result,
+    cause,
+  });
+}
 
-/**
- * Parse an OpenCode process result through the full supervisor pipeline.
- *
- * Pipeline:
- * 1. `parseOpenCodeOutput` — extract assistant text from JSONL transport events
- * 2. `parseAgentEnvelope` — parse assistant text into a validated `AgentEnvelope`
- * 3. `assertAgentEnvelopeRole("supervisor")` — ensure role is supervisor
- * 4. `parseSupervisorPayload` — parse envelope payload into `SupervisorAgentPayload`
- * 5. `toSupervisorResult` — convert payload + envelope to `SupervisorResult`
- * 6. `validateSupervisorResultSemantics` — semantic validation (paths, duplicates, etc.)
- *
- * Each step wraps its native error in `SupervisorIntegrationError` with a
- * descriptive `code` while preserving the original error as `cause`.
- */
-export function integrateSupervisorOutput(
-  processResult: OpenCodeProcessResult,
-): SupervisorIntegrationResult {
-  let parsedOutput: ParsedOpenCodeOutput;
+export function interpretSupervisorOpenCodeResult(
+  result: OpenCodeProcessResult,
+): SupervisorOpenCodeInterpretation {
+  if (result.stdoutTruncated || result.timedOut || result.aborted) {
+    try {
+      parseOpenCodeOutput(result);
+    } catch (error) {
+      if (error instanceof OpenCodeOutputParseError) {
+        throw toInterpretationError(
+          "No se pudo interpretar la salida de OpenCode del supervisor.",
+          "OUTPUT_PARSE_FAILED",
+          result,
+          error,
+        );
+      }
 
-  try {
-    parsedOutput = parseOpenCodeOutput(processResult);
-  } catch (error) {
-    throw new SupervisorIntegrationError(
-      "No se pudo parsear la salida de OpenCode.",
-      { code: "OUTPUT_PARSE_FAILED", cause: error },
+      throw error;
+    }
+  }
+
+  if (result.signal !== null) {
+    throw toInterpretationError(
+      "El proceso del supervisor terminó por signal.",
+      "PROCESS_SIGNALED",
+      result,
     );
   }
 
-  let envelope: AgentEnvelope;
-
-  try {
-    envelope = parseAgentEnvelope(parsedOutput.assistantText);
-  } catch (error) {
-    throw new SupervisorIntegrationError(
-      "No se pudo parsear el envelope del agente.",
-      { code: "ENVELOPE_PARSE_FAILED", cause: error },
+  if (result.exitCode === null) {
+    throw toInterpretationError(
+      "El proceso del supervisor terminó sin exit code.",
+      "PROCESS_EXIT_UNKNOWN",
+      result,
     );
   }
 
-  try {
-    assertAgentEnvelopeRole(envelope, "supervisor");
-  } catch (error) {
-    throw new SupervisorIntegrationError(
-      `Role esperado "supervisor", recibido "${envelope.role}".`,
-      { code: "ROLE_MISMATCH", cause: error },
+  if (result.exitCode !== 0) {
+    throw toInterpretationError(
+      "El proceso del supervisor terminó con exit code no exitoso.",
+      "PROCESS_EXIT_NOT_ZERO",
+      result,
     );
   }
 
-  let payload: SupervisorAgentPayload;
+  const parsedOutput = (() => {
+    try {
+      return parseOpenCodeOutput(result);
+    } catch (error) {
+      if (error instanceof OpenCodeOutputParseError) {
+        throw toInterpretationError(
+          "No se pudo interpretar la salida de OpenCode del supervisor.",
+          "OUTPUT_PARSE_FAILED",
+          result,
+          error,
+        );
+      }
 
-  try {
-    payload = parseSupervisorPayload(envelope.payload);
-  } catch (error) {
-    throw new SupervisorIntegrationError(
-      "No se pudo parsear el payload del supervisor.",
-      { code: "PAYLOAD_PARSE_FAILED", cause: error },
+      throw error;
+    }
+  })();
+
+  if (parsedOutput.finished !== true) {
+    throw toInterpretationError(
+      "La salida del supervisor no está finalizada.",
+      "OUTPUT_NOT_FINISHED",
+      result,
     );
   }
 
-  const supervisorResult = toSupervisorResult(envelope, payload);
+  const envelope = (() => {
+    try {
+      return parseAgentEnvelope(parsedOutput.assistantText);
+    } catch (error) {
+      if (error instanceof AgentProtocolParseError) {
+        throw toInterpretationError(
+          "No se pudo interpretar el envelope del supervisor.",
+          "PROTOCOL_PARSE_FAILED",
+          result,
+          error,
+        );
+      }
 
-  try {
-    validateSupervisorResultSemantics(supervisorResult);
-  } catch (error) {
-    throw new SupervisorIntegrationError(
-      "Validación semántica del supervisor falló.",
-      { code: "SEMANTIC_VALIDATION_FAILED", cause: error },
+      throw error;
+    }
+  })();
+
+  if (envelope.status !== "COMPLETED") {
+    throw toInterpretationError(
+      `El supervisor devolvió un status no aceptado: ${envelope.status}.`,
+      "AGENT_STATUS_NOT_ACCEPTED",
+      result,
     );
   }
 
-  return { supervisorResult, parsedOutput, envelope, payload };
+  const supervisorResult = (() => {
+    try {
+      return parseSupervisorAgentResult(envelope);
+    } catch (error) {
+      if (error instanceof AgentProtocolParseError && error.code === "ROLE_MISMATCH") {
+        throw toInterpretationError(
+          "El envelope no corresponde al role supervisor.",
+          "ROLE_MISMATCH",
+          result,
+          error,
+        );
+      }
+
+      if (error instanceof SupervisorPayloadValidationError) {
+        throw toInterpretationError(
+          "El payload del supervisor es inválido.",
+          "SUPERVISOR_PAYLOAD_INVALID",
+          result,
+          error,
+        );
+      }
+
+      if (error instanceof SupervisorPayloadSemanticError) {
+        throw toInterpretationError(
+          "El payload del supervisor es semánticamente inválido.",
+          "SUPERVISOR_PAYLOAD_SEMANTIC_ERROR",
+          result,
+          error,
+        );
+      }
+
+      throw error;
+    }
+  })();
+
+  return {
+    supervisorResult,
+    sessionID: parsedOutput.sessionID,
+    messageID: parsedOutput.messageID,
+  };
 }
