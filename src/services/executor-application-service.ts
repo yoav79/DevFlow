@@ -77,11 +77,7 @@ function buildPromptInput(database: DatabaseSync, taskId: string): {
     );
   }
 
-  const workspace = readyWorkspaces[0];
-
-  if (workspace === undefined) {
-    throw new Error(`La tarea ${id} no tiene un workspace listo para ejecutar.`);
-  }
+  const workspace = readyWorkspaces[0]!;
 
   return {
     taskId: task.id,
@@ -128,6 +124,20 @@ export async function executeExecutorForTask(
   );
   const runExecutor = deps?.runExecutor ?? runExecutorWithOpenCode;
   const interpretation: ExecutorOpenCodeInterpretation = await runExecutor(promptInput, runtime);
+
+  const reloadedTask = getTaskById(database, normalizedTaskId);
+
+  if (reloadedTask === null) {
+    throw new Error(
+      `La tarea ${normalizedTaskId} ya no existe después de la ejecución del executor.`,
+    );
+  }
+
+  if (reloadedTask.state !== "EXECUTING") {
+    throw new Error(
+      `La tarea ${normalizedTaskId} cambió de estado durante la ejecución del executor. Se esperaba EXECUTING y se encontró ${reloadedTask.state}.`,
+    );
+  }
 
   const now = new Date().toISOString();
   const updatedTask = updateTaskState(database, normalizedTaskId, "VERIFYING", now);

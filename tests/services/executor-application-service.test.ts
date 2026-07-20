@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 
 import { createProject } from "../../src/repositories/project-repository.js";
-import { createTask, getTaskById, updateTaskState } from "../../src/repositories/task-repository.js";
+import { createTask, getTaskById } from "../../src/repositories/task-repository.js";
 import {
   createTaskWorkspace,
   updateTaskWorkspaceStatus,
@@ -124,10 +124,6 @@ function createTestWorkspace(
   }
 
   return workspace;
-}
-
-function moveToExecuting(tempDb: TempDatabase, taskId: string): void {
-  updateTaskState(tempDb.database, taskId, "EXECUTING", new Date().toISOString());
 }
 
 function persistContract(tempDb: TempDatabase, taskId: string): void {
@@ -499,5 +495,205 @@ describe("executeExecutorForTask", () => {
     });
 
     expect(capturedCwd).toBe("/my/special/workspace");
+  });
+
+  it("transitions EXECUTING to VERIFYING for BLOCKED status without creating human requests", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
+    persistContract(tempDb, task.id);
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    const blockedEnvelope: AgentEnvelope = {
+      protocolVersion: 1,
+      role: "executor",
+      status: "BLOCKED",
+      summary: "Cannot proceed: missing dependency",
+      questions: [],
+      risks: ["Dependency X is unavailable"],
+      payload: { filesClaimed: [], commandsClaimed: [] },
+    };
+    const interpretation = createInterpretation(blockedEnvelope);
+
+    const result = await executeExecutorForTask(tempDb.database, task.id, createRuntime(), {
+      runExecutor: async () => interpretation,
+    });
+
+    expect(result.interpretation.envelope.status).toBe("BLOCKED");
+    expect(result.interpretation.envelope.risks).toEqual(["Dependency X is unavailable"]);
+    expect(getTaskById(tempDb.database, task.id)?.state).toBe("VERIFYING");
+  });
+
+  it("transitions EXECUTING to VERIFYING for FAILED status without treating it as application rejection", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
+    persistContract(tempDb, task.id);
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    const failedEnvelope: AgentEnvelope = {
+      protocolVersion: 1,
+      role: "executor",
+      status: "FAILED",
+      summary: "Build failed due to type errors",
+      questions: [],
+      risks: [],
+      payload: { filesClaimed: [], commandsClaimed: [] },
+    };
+    const interpretation = createInterpretation(failedEnvelope);
+
+    const result = await executeExecutorForTask(tempDb.database, task.id, createRuntime(), {
+      runExecutor: async () => interpretation,
+    });
+
+    expect(result.interpretation.envelope.status).toBe("FAILED");
+    expect(getTaskById(tempDb.database, task.id)?.state).toBe("VERIFYING");
+  });
+
+  it("rejects multiple READY workspaces without running the executor", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
+    persistContract(tempDb, task.id);
+    createTestWorkspace(tempDb, task.id, { id: "ws-1", executionNumber: 1, status: "READY" });
+    createTestWorkspace(tempDb, task.id, {
+      id: "ws-2",
+      executionNumber: 2,
+      workspacePath: "/home/user/.devflow/worktrees/proj-1/task-1/2",
+      status: "READY",
+    });
+    let called = false;
+
+    await expect(
+      executeExecutorForTask(tempDb.database, task.id, createRuntime(), {
+        runExecutor: async () => {
+          called = true;
+          return createInterpretation();
+        },
+      }),
+    ).rejects.toThrow(`La tarea ${task.id} tiene múltiples workspaces listos: 2.`);
+
+    expect(called).toBe(false);
+    expect(getTaskById(tempDb.database, task.id)?.state).toBe("EXECUTING");
+  });
+
+  it("detects concurrent state change after executor finishes", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
+    persistContract(tempDb, task.id);
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+
+    await expect(
+      executeExecutorForTask(tempDb.database, task.id, createRuntime(), {
+        runExecutor: async () => {
+          tempDb.database.exec("PRAGMA foreign_keys = OFF;");
+          tempDb.database
+            .prepare("UPDATE tasks SET state = ?, updatedAt = ? WHERE id = ?")
+            .run("BLOCKED", new Date().toISOString(), task.id);
+          tempDb.database.exec("PRAGMA foreign_keys = ON;");
+          return createInterpretation();
+        },
+      }),
+    ).rejects.toThrow(
+      `La tarea ${task.id} cambió de estado durante la ejecución del executor. Se esperaba EXECUTING y se encontró BLOCKED.`,
+    );
+
+    expect(getTaskById(tempDb.database, task.id)?.state).toBe("BLOCKED");
+  });
+
+  it("detects task deletion after executor finishes", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
+    persistContract(tempDb, task.id);
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+
+    await expect(
+      executeExecutorForTask(tempDb.database, task.id, createRuntime(), {
+        runExecutor: async () => {
+          tempDb.database.exec("PRAGMA foreign_keys = OFF;");
+          tempDb.database.prepare("DELETE FROM task_workspaces WHERE taskId = ?").run(task.id);
+          tempDb.database.prepare("DELETE FROM tasks WHERE id = ?").run(task.id);
+          tempDb.database.exec("PRAGMA foreign_keys = ON;");
+          return createInterpretation();
+        },
+      }),
+    ).rejects.toThrow(
+      `La tarea ${task.id} ya no existe después de la ejecución del executor.`,
+    );
+  });
+
+  it("re-reads task after runner completes before updating state", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
+    persistContract(tempDb, task.id);
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    const callOrder: string[] = [];
+
+    await executeExecutorForTask(tempDb.database, task.id, createRuntime(), {
+      runExecutor: async () => {
+        callOrder.push("runner");
+        return createInterpretation();
+      },
+    });
+
+    callOrder.push("post-read-verified");
+
+    expect(callOrder).toEqual(["runner", "post-read-verified"]);
+    expect(getTaskById(tempDb.database, task.id)?.state).toBe("VERIFYING");
+  });
+
+  it("preserves questions from NEEDS_INPUT interpretation", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
+    persistContract(tempDb, task.id);
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    const envelope: AgentEnvelope = {
+      protocolVersion: 1,
+      role: "executor",
+      status: "NEEDS_INPUT",
+      summary: "Need clarification",
+      questions: ["Which auth provider?", "Which session strategy?"],
+      risks: [],
+      payload: { filesClaimed: [], commandsClaimed: [] },
+    };
+
+    const result = await executeExecutorForTask(tempDb.database, task.id, createRuntime(), {
+      runExecutor: async () => createInterpretation(envelope),
+    });
+
+    expect(result.interpretation.envelope.questions).toEqual([
+      "Which auth provider?",
+      "Which session strategy?",
+    ]);
+    expect(getTaskById(tempDb.database, task.id)?.state).toBe("VERIFYING");
+  });
+
+  it("does not create human requests for any executor status", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
+    persistContract(tempDb, task.id);
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    const envelope: AgentEnvelope = {
+      protocolVersion: 1,
+      role: "executor",
+      status: "NEEDS_INPUT",
+      summary: "Need input",
+      questions: ["Question?"],
+      risks: ["Risk?"],
+      payload: { filesClaimed: [], commandsClaimed: [] },
+    };
+
+    await executeExecutorForTask(tempDb.database, task.id, createRuntime(), {
+      runExecutor: async () => createInterpretation(envelope),
+    });
+
+    const requests = tempDb.database
+      .prepare("SELECT * FROM human_requests WHERE taskId = ?")
+      .all(task.id) as Record<string, unknown>[];
+
+    expect(requests).toHaveLength(0);
   });
 });
