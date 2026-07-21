@@ -1,20 +1,7 @@
-import { afterEach, describe, expect, it } from "vitest";
-import type { DatabaseSync } from "node:sqlite";
-
-import { createProject } from "../../src/repositories/project-repository.js";
-import {
-  createTask,
-  getTaskById,
-} from "../../src/repositories/task-repository.js";
-import {
-  createTaskWorkspace,
-  updateTaskWorkspaceStatus,
-} from "../../src/repositories/task-workspace-repository.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildDeterministicRevision,
-  executeDeterministicRevision,
   DeterministicRevisionError,
-  type DeterministicRevisionResult,
   type BuildDeterministicRevisionInput,
   type DeterministicRevisionDeps,
 } from "../../src/services/deterministic-revision-result.js";
@@ -25,10 +12,7 @@ import type {
 import type { PathValidationResult } from "../../src/services/path-validation.js";
 import type {
   RequiredCommandsExecutionResult,
-  RequiredCommandRuntimeOptions,
 } from "../../src/services/required-command-runner.js";
-import type { Project, Task, TaskWorkspace } from "../../src/types.js";
-import { createTempDatabase, type TempDatabase } from "../helpers/temp-database.js";
 
 function file(
   path: string,
@@ -42,54 +26,6 @@ function fileRenamed(
   path: string,
 ): ChangedFile {
   return { path, status: "RENAMED", previousPath };
-}
-
-function createTestProject(tempDb: TempDatabase): Project {
-  return createProject(tempDb.database, {
-    id: "proj-1",
-    name: "Alpha",
-    repositoryPath: "/repo/main",
-    defaultBranch: "main",
-    createdAt: new Date().toISOString(),
-  });
-}
-
-function createTestTask(
-  tempDb: TempDatabase,
-  projectId: string,
-  overrides: Partial<Task> = {},
-): Task {
-  return createTask(tempDb.database, {
-    id: overrides.id ?? "task-1",
-    projectId,
-    title: overrides.title ?? "Test Task",
-    description: overrides.description ?? "A test task",
-    state: overrides.state ?? "VERIFYING",
-    attempt: overrides.attempt ?? 1,
-    maxAttempts: overrides.maxAttempts ?? 3,
-    contractJson: overrides.contractJson ?? null,
-    currentRevisionJson: overrides.currentRevisionJson ?? null,
-    createdAt: overrides.createdAt ?? new Date().toISOString(),
-    updatedAt: overrides.updatedAt ?? new Date().toISOString(),
-  });
-}
-
-function createTestWorkspace(
-  tempDb: TempDatabase,
-  taskId: string,
-  overrides: Partial<TaskWorkspace> = {},
-): TaskWorkspace {
-  return createTaskWorkspace(tempDb.database, {
-    id: overrides.id ?? "ws-1",
-    taskId,
-    executionNumber: overrides.executionNumber ?? 1,
-    workspacePath: overrides.workspacePath ?? "/home/user/.devflow/worktrees/proj-1/task-1/1",
-    branchName: overrides.branchName ?? "devflow/proj-1/task-1/execution-1",
-    baseCommit: overrides.baseCommit ?? "abc123",
-    ...(overrides.status !== undefined
-      ? { status: overrides.status }
-      : {}),
-  });
 }
 
 function createInput(
@@ -107,6 +43,10 @@ function createInput(
     runtime: overrides.runtime ?? { timeoutMs: 5000 },
   };
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function createDeps(overrides: {
   gitResult?: GitChangeDetectionResult;
@@ -399,145 +339,50 @@ describe("buildDeterministicRevision", () => {
 
     expect(receivedCommands).toEqual(["npm test", "npm run lint"]);
   });
-});
+  it("serializes as exact JSON round-trip", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-20T12:00:00.000Z"));
 
-describe("executeDeterministicRevision", () => {
-  let tempDb: TempDatabase;
+    const result = await buildDeterministicRevision(createInput(), createDeps());
 
-  afterEach(() => {
-    tempDb?.cleanup();
+    expect(JSON.parse(JSON.stringify(result))).toEqual(result);
   });
 
-  it("persists revision and updates task state to REVIEWING", async () => {
-    tempDb = createTempDatabase();
-    const project = createTestProject(tempDb);
-    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
-    createTestWorkspace(tempDb, task.id);
+  it("is deterministic with fixed time and deterministic deps", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-20T12:00:00.000Z"));
 
-    const deps = createDeps();
-    const result = await executeDeterministicRevision(
-      tempDb.database,
-      createInput(),
-      deps,
-    );
-
-    expect(result.status).toBe("REVIEWING");
-
-    const updatedTask = getTaskById(tempDb.database, task.id);
-    expect(updatedTask!.state).toBe("REVIEWING");
-    expect(updatedTask!.currentRevisionJson).not.toBeNull();
-
-    const parsed = JSON.parse(updatedTask!.currentRevisionJson!);
-    expect(parsed.taskId).toBe(task.id);
-    expect(parsed.status).toBe("REVIEWING");
-  });
-
-  it("updates task state to REVISION_REQUIRED on path violations", async () => {
-    tempDb = createTempDatabase();
-    const project = createTestProject(tempDb);
-    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
-    createTestWorkspace(tempDb, task.id);
-
-    const gitResult: GitChangeDetectionResult = {
-      baseCommit: "abc123",
-      changedFiles: [file("src/api/secret.ts", "ADDED")],
-    };
-
-    const pathResult: PathValidationResult = {
-      passed: false,
-      violations: [
-        {
-          path: "src/api/secret.ts",
-          status: "ADDED",
-          code: "FORBIDDEN",
-          message: 'Path prohibido: src/api/secret.ts coincide con la regla forbidden "src/api".',
-        },
-      ],
-    };
-
-    const deps = createDeps({ gitResult, pathResult });
-    const result = await executeDeterministicRevision(
-      tempDb.database,
-      createInput({ allowedPaths: ["src"], forbiddenPaths: ["src/api"] }),
-      deps,
-    );
-
-    expect(result.status).toBe("REVISION_REQUIRED");
-
-    const updatedTask = getTaskById(tempDb.database, task.id);
-    expect(updatedTask!.state).toBe("REVISION_REQUIRED");
-  });
-
-  it("throws for nonexistent task", async () => {
-    tempDb = createTempDatabase();
-    const project = createTestProject(tempDb);
-
-    await expect(
-      executeDeterministicRevision(
-        tempDb.database,
-        createInput({ taskId: "nonexistent" }),
-        createDeps(),
-      ),
-    ).rejects.toThrow(DeterministicRevisionError);
-  });
-
-  it("throws for task not in VERIFYING state", async () => {
-    tempDb = createTempDatabase();
-    const project = createTestProject(tempDb);
-    const task = createTestTask(tempDb, project.id, { state: "EXECUTING" });
-    createTestWorkspace(tempDb, task.id);
-
-    await expect(
-      executeDeterministicRevision(
-        tempDb.database,
-        createInput(),
-        createDeps(),
-      ),
-    ).rejects.toThrow(DeterministicRevisionError);
-  });
-
-  it("serializes result as JSON to currentRevisionJson", async () => {
-    tempDb = createTempDatabase();
-    const project = createTestProject(tempDb);
-    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
-    createTestWorkspace(tempDb, task.id);
-
-    await executeDeterministicRevision(
-      tempDb.database,
-      createInput({ taskId: task.id }),
-      createDeps(),
-    );
-
-    const updatedTask = getTaskById(tempDb.database, task.id);
-    const parsed = JSON.parse(updatedTask!.currentRevisionJson!);
-
-    expect(parsed.taskId).toBe(task.id);
-    expect(parsed.projectId).toBe(project.id);
-    expect(parsed.baseCommit).toBe("abc123");
-    expect(parsed.changedFiles).toEqual([]);
-    expect(parsed.pathValidation).toEqual({ passed: true, violations: [] });
-    expect(parsed.commandsResult).toBeNull();
-    expect(parsed.generatedAt).toBeDefined();
-  });
-
-  it("clears previous revisionJson on new execution", async () => {
-    tempDb = createTempDatabase();
-    const project = createTestProject(tempDb);
-    const task = createTestTask(tempDb, project.id, {
-      state: "VERIFYING",
-      currentRevisionJson: JSON.stringify({ old: "data" }),
+    const deps = createDeps({
+      gitResult: {
+        baseCommit: "abc123",
+        changedFiles: [file("src/index.ts", "MODIFIED")],
+      },
     });
-    createTestWorkspace(tempDb, task.id);
 
-    await executeDeterministicRevision(
-      tempDb.database,
-      createInput({ taskId: task.id }),
-      createDeps(),
+    const first = await buildDeterministicRevision(createInput(), deps);
+    const second = await buildDeterministicRevision(createInput(), deps);
+
+    expect(first).toEqual(second);
+  });
+
+  it("does not mutate input arrays", async () => {
+    const allowedPaths = ["src"];
+    const forbiddenPaths = ["src/api"];
+    const requiredCommands = ["npm test"];
+
+    await buildDeterministicRevision(
+      createInput({ allowedPaths, forbiddenPaths, requiredCommands }),
+      createDeps({
+        commandsResult: {
+          results: [],
+          passed: true,
+          stoppedAtIndex: null,
+        },
+      }),
     );
 
-    const updatedTask = getTaskById(tempDb.database, task.id);
-    const parsed = JSON.parse(updatedTask!.currentRevisionJson!);
-    expect(parsed.taskId).toBe(task.id);
-    expect(parsed).not.toHaveProperty("old");
+    expect(allowedPaths).toEqual(["src"]);
+    expect(forbiddenPaths).toEqual(["src/api"]);
+    expect(requiredCommands).toEqual(["npm test"]);
   });
 });

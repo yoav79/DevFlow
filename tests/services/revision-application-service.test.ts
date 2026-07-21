@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { DatabaseSync } from "node:sqlite";
 
 import { createProject } from "../../src/repositories/project-repository.js";
 import {
@@ -15,7 +14,10 @@ import {
   RevisionApplicationError,
   type RevisionApplicationDeps,
 } from "../../src/services/revision-application-service.js";
-import type { DeterministicRevisionResult } from "../../src/services/deterministic-revision-result.js";
+import type {
+  BuildDeterministicRevisionInput,
+  DeterministicRevisionResult,
+} from "../../src/services/deterministic-revision-result.js";
 import type { ExecutableTaskContract, Project, Task, TaskWorkspace } from "../../src/types.js";
 import { createTempDatabase, type TempDatabase } from "../helpers/temp-database.js";
 
@@ -133,7 +135,7 @@ function createDeps(
   result: DeterministicRevisionResult,
 ): RevisionApplicationDeps {
   return {
-    runRevision: (_database, _input) => Promise.resolve(result),
+    buildRevision: (_input) => Promise.resolve(result),
   };
 }
 
@@ -154,7 +156,7 @@ describe("executeRevisionForTask", () => {
     let receivedInput: unknown = null;
 
     const deps: RevisionApplicationDeps = {
-      runRevision: (_database, input) => {
+      buildRevision: (input) => {
         receivedInput = input;
         return Promise.resolve(createSuccessfulResult(task.id));
       },
@@ -220,20 +222,12 @@ describe("executeRevisionForTask", () => {
     persistContract(tempDb, task.id);
 
     const mockResult = createSuccessfulResult(task.id);
-    const deps: RevisionApplicationDeps = {
-      runRevision: (database, input) => {
-        database
-          .prepare("UPDATE tasks SET currentRevisionJson = ?, state = ?, updatedAt = ? WHERE id = ?")
-          .run(JSON.stringify(mockResult), "REVIEWING", new Date().toISOString(), input.taskId);
-        return Promise.resolve(mockResult);
-      },
-    };
 
     await executeRevisionForTask(
       tempDb.database,
       task.id,
       { timeoutMs: 5000 },
-      deps,
+      createDeps(mockResult),
     );
 
     const updatedTask = getTaskById(tempDb.database, task.id);
@@ -249,25 +243,40 @@ describe("executeRevisionForTask", () => {
     persistContract(tempDb, task.id);
 
     const mockResult = createFailingResult(task.id);
-    const deps: RevisionApplicationDeps = {
-      runRevision: (database, input) => {
-        database
-          .prepare("UPDATE tasks SET currentRevisionJson = ?, state = ?, updatedAt = ? WHERE id = ?")
-          .run(JSON.stringify(mockResult), "REVISION_REQUIRED", new Date().toISOString(), input.taskId);
-        return Promise.resolve(mockResult);
-      },
-    };
 
     await executeRevisionForTask(
       tempDb.database,
       task.id,
       { timeoutMs: 5000 },
-      deps,
+      createDeps(mockResult),
     );
 
     const updatedTask = getTaskById(tempDb.database, task.id);
     expect(updatedTask!.state).toBe("REVISION_REQUIRED");
     expect(updatedTask!.currentRevisionJson).not.toBeNull();
+  });
+
+  it("persists the exact DeterministicRevisionResult to currentRevisionJson", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, {
+      state: "VERIFYING",
+      currentRevisionJson: JSON.stringify({ old: "data" }),
+    });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const result = createFailingResult(task.id);
+
+    await executeRevisionForTask(
+      tempDb.database,
+      task.id,
+      { timeoutMs: 5000 },
+      createDeps(result),
+    );
+
+    const updatedTask = getTaskById(tempDb.database, task.id);
+    expect(JSON.parse(updatedTask!.currentRevisionJson!)).toEqual(result);
   });
 
   it("throws for nonexistent task", async () => {
@@ -333,11 +342,18 @@ describe("executeRevisionForTask", () => {
     ).rejects.toThrow(RevisionApplicationError);
   });
 
-  it("throws for task with non-READY workspace", async () => {
+  it("throws for task with multiple READY workspaces", async () => {
     tempDb = createTempDatabase();
     const project = createTestProject(tempDb);
     const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
-    createTestWorkspace(tempDb, task.id, { status: "FAILED" });
+    createTestWorkspace(tempDb, task.id, { id: "ws-1", status: "READY" });
+    createTestWorkspace(tempDb, task.id, {
+      id: "ws-2",
+      executionNumber: 2,
+      workspacePath: "/home/user/.devflow/worktrees/proj-1/task-1/2",
+      branchName: "devflow/proj-1/task-1/execution-2",
+      status: "READY",
+    });
     persistContract(tempDb, task.id);
 
     await expect(
@@ -348,6 +364,96 @@ describe("executeRevisionForTask", () => {
         createDeps(createSuccessfulResult(task.id)),
       ),
     ).rejects.toThrow(RevisionApplicationError);
+  });
+
+  it("does not persist or transition when buildRevision fails", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, {
+      state: "VERIFYING",
+      currentRevisionJson: JSON.stringify({ old: "data" }),
+    });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const error = new Error("build failed");
+
+    await expect(
+      executeRevisionForTask(
+        tempDb.database,
+        task.id,
+        { timeoutMs: 5000 },
+        {
+          buildRevision: () => Promise.reject(error),
+        },
+      ),
+    ).rejects.toBe(error);
+
+    const updatedTask = getTaskById(tempDb.database, task.id);
+    expect(updatedTask!.state).toBe("VERIFYING");
+    expect(updatedTask!.currentRevisionJson).toBe(JSON.stringify({ old: "data" }));
+  });
+
+  it("revalidates VERIFYING after loading context and aborts concurrent state changes before build", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    let buildCalled = false;
+
+    await expect(
+      executeRevisionForTask(
+        tempDb.database,
+        task.id,
+        { timeoutMs: 5000 },
+        {
+          beforeRevalidate: () => {
+            tempDb.database
+              .prepare("UPDATE tasks SET state = ?, updatedAt = ? WHERE id = ?")
+              .run("EXECUTING", new Date().toISOString(), task.id);
+          },
+          buildRevision: () => {
+            buildCalled = true;
+            return Promise.resolve(createSuccessfulResult(task.id));
+          },
+        },
+      ),
+    ).rejects.toThrow(RevisionApplicationError);
+
+    expect(buildCalled).toBe(false);
+    const updatedTask = getTaskById(tempDb.database, task.id);
+    expect(updatedTask!.state).toBe("EXECUTING");
+    expect(updatedTask!.currentRevisionJson).toBeNull();
+  });
+
+  it("retains the residual risk window after the last revalidation and before updateTaskState", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const result = createSuccessfulResult(task.id);
+
+    await executeRevisionForTask(
+      tempDb.database,
+      task.id,
+      { timeoutMs: 5000 },
+      {
+        buildRevision: (_input: BuildDeterministicRevisionInput) => {
+          tempDb.database
+            .prepare("UPDATE tasks SET state = ?, updatedAt = ? WHERE id = ?")
+            .run("EXECUTING", new Date().toISOString(), task.id);
+          return Promise.resolve(result);
+        },
+      },
+    );
+
+    const updatedTask = getTaskById(tempDb.database, task.id);
+    expect(updatedTask!.state).toBe("REVIEWING");
+    expect(JSON.parse(updatedTask!.currentRevisionJson!)).toEqual(result);
   });
 
   it("throws for empty taskId", async () => {

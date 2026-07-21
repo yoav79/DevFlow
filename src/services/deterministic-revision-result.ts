@@ -1,8 +1,3 @@
-/// <reference types="node" />
-
-import type { DatabaseSync } from "node:sqlite";
-
-import { getTaskById, updateTaskState } from "../repositories/task-repository.js";
 import {
   detectGitChanges,
   type ChangedFile,
@@ -11,11 +6,9 @@ import {
 import {
   validateChangedPaths,
   type PathValidationResult,
-  type PathViolation,
 } from "./path-validation.js";
 import {
   runRequiredCommands,
-  type RequiredCommandResult,
   type RequiredCommandRuntimeOptions,
   type RequiredCommandsExecutionResult,
 } from "./required-command-runner.js";
@@ -42,12 +35,9 @@ export interface DeterministicRevisionErrorContext {
     | "INVALID_PROJECT_ID"
     | "INVALID_WORKSPACE_ID"
     | "INVALID_COMMANDS"
-    | "TASK_NOT_FOUND"
-    | "TASK_NOT_IN_VERIFYING"
     | "GIT_DETECTION_FAILED"
     | "PATH_VALIDATION_FAILED"
-    | "COMMAND_EXECUTION_FAILED"
-    | "REVISION_PERSIST_FAILED";
+    | "COMMAND_EXECUTION_FAILED";
   readonly message: string;
   readonly cause?: unknown;
 }
@@ -164,71 +154,4 @@ export async function buildDeterministicRevision(
     status,
     generatedAt: new Date().toISOString(),
   };
-}
-
-function persistRevision(
-  database: DatabaseSync,
-  taskId: string,
-  result: DeterministicRevisionResult,
-): void {
-  let serialized: string;
-
-  try {
-    serialized = JSON.stringify(result);
-  } catch (error) {
-    throw new DeterministicRevisionError(
-      "No se pudo serializar el resultado de revisión.",
-      { code: "REVISION_PERSIST_FAILED", cause: error },
-    );
-  }
-
-  const now = new Date().toISOString();
-
-  const updateResult = database
-    .prepare("UPDATE tasks SET currentRevisionJson = ?, updatedAt = ? WHERE id = ?")
-    .run(serialized, now, taskId);
-
-  if (updateResult.changes === 0) {
-    throw new DeterministicRevisionError(
-      `No se pudo persistir la revisión para la tarea ${taskId}.`,
-      { code: "REVISION_PERSIST_FAILED" },
-    );
-  }
-}
-
-export async function executeDeterministicRevision(
-  database: DatabaseSync,
-  input: BuildDeterministicRevisionInput,
-  deps?: DeterministicRevisionDeps,
-): Promise<DeterministicRevisionResult> {
-  const taskId = validateString(input.taskId, "taskId");
-
-  const task = getTaskById(database, taskId);
-  if (task === null) {
-    throw new DeterministicRevisionError(
-      `No existe la tarea: ${taskId}`,
-      { code: "TASK_NOT_FOUND" },
-    );
-  }
-
-  if (task.state !== "VERIFYING") {
-    throw new DeterministicRevisionError(
-      `La tarea ${taskId} no puede ejecutar la revisión desde el estado ${task.state}. Se esperaba VERIFYING.`,
-      { code: "TASK_NOT_IN_VERIFYING" },
-    );
-  }
-
-  const result = await buildDeterministicRevision(input, deps);
-
-  persistRevision(database, taskId, result);
-
-  if (result.status === "REVISION_REQUIRED") {
-    const now = new Date().toISOString();
-    updateTaskState(database, taskId, "REVISION_REQUIRED", now);
-  } else {
-    const now = new Date().toISOString();
-    updateTaskState(database, taskId, "REVIEWING", now);
-  }
-
-  return result;
 }

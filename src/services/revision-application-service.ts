@@ -6,17 +6,19 @@ import { getProjectById } from "../repositories/project-repository.js";
 import {
   getTaskById,
   getTaskContract,
+  updateTaskState,
 } from "../repositories/task-repository.js";
 import { listTaskWorkspacesByTaskId } from "../repositories/task-workspace-repository.js";
 import {
-  executeDeterministicRevision,
+  buildDeterministicRevision,
   type BuildDeterministicRevisionInput,
   type DeterministicRevisionResult,
 } from "./deterministic-revision-result.js";
 import type { RequiredCommandRuntimeOptions } from "./required-command-runner.js";
 
 export interface RevisionApplicationDeps {
-  readonly runRevision?: typeof executeDeterministicRevision;
+  readonly beforeRevalidate?: () => void | Promise<void>;
+  readonly buildRevision?: typeof buildDeterministicRevision;
 }
 
 export interface ExecuteRevisionForTaskResult {
@@ -33,6 +35,7 @@ export class RevisionApplicationError extends Error {
     | "TASK_NOT_IN_VERIFYING"
     | "NO_WORKSPACE"
     | "NO_CONTRACT"
+    | "REVISION_PERSIST_FAILED"
     | "REVISION_FAILED";
 
   constructor(
@@ -48,6 +51,40 @@ export class RevisionApplicationError extends Error {
     if (options.cause !== undefined) {
       this.cause = options.cause;
     }
+  }
+}
+
+function requireTask(
+  database: DatabaseSync,
+  taskId: string,
+): NonNullable<ReturnType<typeof getTaskById>> {
+  const task = getTaskById(database, taskId);
+  if (task === null) {
+    throw new RevisionApplicationError(
+      `No existe la tarea: ${taskId}`,
+      { code: "TASK_NOT_FOUND" },
+    );
+  }
+
+  return task;
+}
+
+function assertTaskIsVerifying(
+  task: ReturnType<typeof getTaskById>,
+  taskId: string,
+): void {
+  if (task === null) {
+    throw new RevisionApplicationError(
+      `No existe la tarea: ${taskId}`,
+      { code: "TASK_NOT_FOUND" },
+    );
+  }
+
+  if (task.state !== "VERIFYING") {
+    throw new RevisionApplicationError(
+      `La tarea ${taskId} no puede ejecutar la revisión desde el estado ${task.state}. Se esperaba VERIFYING.`,
+      { code: "TASK_NOT_IN_VERIFYING" },
+    );
   }
 }
 
@@ -70,20 +107,8 @@ function buildRevisionInput(
     );
   }
 
-  const task = getTaskById(database, id);
-  if (task === null) {
-    throw new RevisionApplicationError(
-      `No existe la tarea: ${id}`,
-      { code: "TASK_NOT_FOUND" },
-    );
-  }
-
-  if (task.state !== "VERIFYING") {
-    throw new RevisionApplicationError(
-      `La tarea ${id} no puede ejecutar la revisión desde el estado ${task.state}. Se esperaba VERIFYING.`,
-      { code: "TASK_NOT_IN_VERIFYING" },
-    );
-  }
+  const task = requireTask(database, id);
+  assertTaskIsVerifying(task, id);
 
   const project = getProjectById(database, task.projectId);
   if (project === null) {
@@ -138,6 +163,44 @@ function buildRevisionInput(
   };
 }
 
+function persistRevision(
+  database: DatabaseSync,
+  taskId: string,
+  result: DeterministicRevisionResult,
+): void {
+  let serialized: string;
+
+  try {
+    serialized = JSON.stringify(result);
+  } catch (error) {
+    throw new RevisionApplicationError(
+      "No se pudo serializar el resultado de revisión.",
+      { code: "REVISION_PERSIST_FAILED", cause: error },
+    );
+  }
+
+  const now = new Date().toISOString();
+
+  const updateResult = database
+    .prepare("UPDATE tasks SET currentRevisionJson = ?, updatedAt = ? WHERE id = ?")
+    .run(serialized, now, taskId);
+
+  if (updateResult.changes === 0) {
+    throw new RevisionApplicationError(
+      `No se pudo persistir la revisión para la tarea ${taskId}.`,
+      { code: "REVISION_PERSIST_FAILED" },
+    );
+  }
+}
+
+function getNextTaskState(
+  result: DeterministicRevisionResult,
+): DeterministicRevisionResult["status"] {
+  return result.status === "REVISION_REQUIRED"
+    ? "REVISION_REQUIRED"
+    : "REVIEWING";
+}
+
 export async function executeRevisionForTask(
   database: DatabaseSync,
   taskId: string,
@@ -147,9 +210,19 @@ export async function executeRevisionForTask(
   const { taskId: normalizedTaskId, projectId, workspaceId, input } =
     buildRevisionInput(database, taskId, runtime);
 
-  const runRevision = deps?.runRevision ?? executeDeterministicRevision;
+  await deps?.beforeRevalidate?.();
 
-  const result = await runRevision(database, input);
+  const latestTask = requireTask(database, normalizedTaskId);
+  assertTaskIsVerifying(latestTask, normalizedTaskId);
+
+  const buildRevision = deps?.buildRevision ?? buildDeterministicRevision;
+
+  const result = await buildRevision(input);
+
+  persistRevision(database, normalizedTaskId, result);
+
+  const now = new Date().toISOString();
+  updateTaskState(database, normalizedTaskId, getNextTaskState(result), now);
 
   return {
     taskId: normalizedTaskId,
