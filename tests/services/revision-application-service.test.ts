@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
+import { initializeSchema, openDatabase } from "../../src/db.js";
 import { createProject } from "../../src/repositories/project-repository.js";
 import {
   createTask,
@@ -136,7 +137,15 @@ function createDeps(
 ): RevisionApplicationDeps {
   return {
     buildRevision: (_input) => Promise.resolve(result),
+    createClaimId: () => "test-claim-id",
+    now: () => "2026-07-20T12:00:00.000Z",
   };
+}
+
+function readTaskRow(tempDb: TempDatabase, taskId: string): Record<string, unknown> {
+  return tempDb.database
+    .prepare("SELECT * FROM tasks WHERE id = ?")
+    .get(taskId) as Record<string, unknown>;
 }
 
 describe("executeRevisionForTask", () => {
@@ -156,6 +165,8 @@ describe("executeRevisionForTask", () => {
     let receivedInput: unknown = null;
 
     const deps: RevisionApplicationDeps = {
+      createClaimId: () => "test-claim-id",
+      now: () => "2026-07-20T12:00:00.000Z",
       buildRevision: (input) => {
         receivedInput = input;
         return Promise.resolve(createSuccessfulResult(task.id));
@@ -233,6 +244,9 @@ describe("executeRevisionForTask", () => {
     const updatedTask = getTaskById(tempDb.database, task.id);
     expect(updatedTask!.state).toBe("REVIEWING");
     expect(updatedTask!.currentRevisionJson).not.toBeNull();
+    const persisted = JSON.parse(updatedTask!.currentRevisionJson!);
+    expect(persisted.taskId).toBe(task.id);
+    expect(persisted.status).toBe("REVIEWING");
   });
 
   it("persists revision and updates task state on failure", async () => {
@@ -254,15 +268,14 @@ describe("executeRevisionForTask", () => {
     const updatedTask = getTaskById(tempDb.database, task.id);
     expect(updatedTask!.state).toBe("REVISION_REQUIRED");
     expect(updatedTask!.currentRevisionJson).not.toBeNull();
+    const persisted = JSON.parse(updatedTask!.currentRevisionJson!);
+    expect(persisted.status).toBe("REVISION_REQUIRED");
   });
 
   it("persists the exact DeterministicRevisionResult to currentRevisionJson", async () => {
     tempDb = createTempDatabase();
     const project = createTestProject(tempDb);
-    const task = createTestTask(tempDb, project.id, {
-      state: "VERIFYING",
-      currentRevisionJson: JSON.stringify({ old: "data" }),
-    });
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
     createTestWorkspace(tempDb, task.id, { status: "READY" });
     persistContract(tempDb, task.id);
 
@@ -366,13 +379,10 @@ describe("executeRevisionForTask", () => {
     ).rejects.toThrow(RevisionApplicationError);
   });
 
-  it("does not persist or transition when buildRevision fails", async () => {
+  it("claim remains persisted when buildRevision fails", async () => {
     tempDb = createTempDatabase();
     const project = createTestProject(tempDb);
-    const task = createTestTask(tempDb, project.id, {
-      state: "VERIFYING",
-      currentRevisionJson: JSON.stringify({ old: "data" }),
-    });
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
     createTestWorkspace(tempDb, task.id, { status: "READY" });
     persistContract(tempDb, task.id);
 
@@ -384,6 +394,8 @@ describe("executeRevisionForTask", () => {
         task.id,
         { timeoutMs: 5000 },
         {
+          createClaimId: () => "orphan-claim",
+          now: () => "2026-07-20T12:00:00.000Z",
           buildRevision: () => Promise.reject(error),
         },
       ),
@@ -391,7 +403,60 @@ describe("executeRevisionForTask", () => {
 
     const updatedTask = getTaskById(tempDb.database, task.id);
     expect(updatedTask!.state).toBe("VERIFYING");
-    expect(updatedTask!.currentRevisionJson).toBe(JSON.stringify({ old: "data" }));
+    expect(updatedTask!.currentRevisionJson).not.toBeNull();
+    const claim = JSON.parse(updatedTask!.currentRevisionJson!);
+    expect(claim.kind).toBe("DETERMINISTIC_REVISION_CLAIM");
+    expect(claim.claimId).toBe("orphan-claim");
+  });
+
+  it("throws REVISION_PERSIST_FAILED when JSON.stringify(result) fails and claim persists", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const serializationError = new Error("toJSON exploded");
+    let builderCalled = false;
+
+    const result = createSuccessfulResult(task.id);
+    Object.defineProperty(result, "toJSON", {
+      value() {
+        throw serializationError;
+      },
+    });
+
+    try {
+      await executeRevisionForTask(
+        tempDb.database,
+        task.id,
+        { timeoutMs: 5000 },
+        {
+          createClaimId: () => "serial-fail-claim",
+          now: () => "2026-07-20T12:00:00.000Z",
+          buildRevision: () => {
+            builderCalled = true;
+            return Promise.resolve(result);
+          },
+        },
+      );
+      expect.fail("should have thrown");
+    } catch (error) {
+      expect(error).toBeInstanceOf(RevisionApplicationError);
+      expect((error as RevisionApplicationError).code).toBe("REVISION_PERSIST_FAILED");
+      expect((error as RevisionApplicationError).cause).toBe(serializationError);
+    }
+
+    expect(builderCalled).toBe(true);
+
+    const updatedTask = getTaskById(tempDb.database, task.id);
+    expect(updatedTask!.state).toBe("VERIFYING");
+    expect(updatedTask!.currentRevisionJson).not.toBeNull();
+    const claim = JSON.parse(updatedTask!.currentRevisionJson!);
+    expect(claim.kind).toBe("DETERMINISTIC_REVISION_CLAIM");
+    expect(claim.taskId).toBe(task.id);
+    expect(claim.claimId).toBe("serial-fail-claim");
+    expect(claim.claimedAt).toBe("2026-07-20T12:00:00.000Z");
   });
 
   it("revalidates VERIFYING after loading context and aborts concurrent state changes before build", async () => {
@@ -409,10 +474,12 @@ describe("executeRevisionForTask", () => {
         task.id,
         { timeoutMs: 5000 },
         {
+          createClaimId: () => "test-claim",
+          now: () => "2026-07-20T12:00:00.000Z",
           beforeRevalidate: () => {
             tempDb.database
               .prepare("UPDATE tasks SET state = ?, updatedAt = ? WHERE id = ?")
-              .run("EXECUTING", new Date().toISOString(), task.id);
+              .run("EXECUTING", "2026-07-20T12:00:00.000Z", task.id);
           },
           buildRevision: () => {
             buildCalled = true;
@@ -428,7 +495,7 @@ describe("executeRevisionForTask", () => {
     expect(updatedTask!.currentRevisionJson).toBeNull();
   });
 
-  it("retains the residual risk window after the last revalidation and before updateTaskState", async () => {
+  it("returns error when state changes during build and finalize fails", async () => {
     tempDb = createTempDatabase();
     const project = createTestProject(tempDb);
     const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
@@ -437,23 +504,26 @@ describe("executeRevisionForTask", () => {
 
     const result = createSuccessfulResult(task.id);
 
-    await executeRevisionForTask(
-      tempDb.database,
-      task.id,
-      { timeoutMs: 5000 },
-      {
-        buildRevision: (_input: BuildDeterministicRevisionInput) => {
-          tempDb.database
-            .prepare("UPDATE tasks SET state = ?, updatedAt = ? WHERE id = ?")
-            .run("EXECUTING", new Date().toISOString(), task.id);
-          return Promise.resolve(result);
+    await expect(
+      executeRevisionForTask(
+        tempDb.database,
+        task.id,
+        { timeoutMs: 5000 },
+        {
+          createClaimId: () => "test-claim",
+          now: () => "2026-07-20T12:00:00.000Z",
+          buildRevision: (_input: BuildDeterministicRevisionInput) => {
+            tempDb.database
+              .prepare("UPDATE tasks SET state = ?, updatedAt = ? WHERE id = ?")
+              .run("EXECUTING", "2026-07-20T12:00:00.000Z", task.id);
+            return Promise.resolve(result);
+          },
         },
-      },
-    );
+      ),
+    ).rejects.toThrow(RevisionApplicationError);
 
     const updatedTask = getTaskById(tempDb.database, task.id);
-    expect(updatedTask!.state).toBe("REVIEWING");
-    expect(JSON.parse(updatedTask!.currentRevisionJson!)).toEqual(result);
+    expect(updatedTask!.state).toBe("EXECUTING");
   });
 
   it("throws for empty taskId", async () => {
@@ -468,5 +538,327 @@ describe("executeRevisionForTask", () => {
         createDeps(createSuccessfulResult("")),
       ),
     ).rejects.toThrow(RevisionApplicationError);
+  });
+
+  it("throws REVISION_ALREADY_RUNNING when claim fails", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const secondDb = openDatabase(tempDb.databasePath);
+    initializeSchema(secondDb);
+
+    try {
+      let hookRan = false;
+
+      await expect(
+        executeRevisionForTask(
+          tempDb.database,
+          task.id,
+          { timeoutMs: 5000 },
+          {
+            createClaimId: () => "new-claim",
+            now: () => "2026-07-20T12:00:00.000Z",
+            buildRevision: () => Promise.resolve(createSuccessfulResult(task.id)),
+            beforeRevalidate: () => {
+              hookRan = true;
+              secondDb
+                .prepare("UPDATE tasks SET currentRevisionJson = ?, updatedAt = ? WHERE id = ?")
+                .run(JSON.stringify({ stolen: true }), "2026-07-20T12:00:01.000Z", task.id);
+            },
+          },
+        ),
+      ).rejects.toThrow(RevisionApplicationError);
+
+      expect(hookRan).toBe(true);
+      const row = readTaskRow(tempDb, task.id);
+      expect(String(row["currentRevisionJson"])).toBe(JSON.stringify({ stolen: true }));
+    } finally {
+      secondDb.close();
+    }
+  });
+
+  it("uses exact same claimJson in claim and finalize", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const result = createSuccessfulResult(task.id);
+    let capturedClaimJson: string | null = null;
+
+    await executeRevisionForTask(
+      tempDb.database,
+      task.id,
+      { timeoutMs: 5000 },
+      {
+        createClaimId: () => "exact-claim",
+        now: () => "2026-07-20T12:00:00.000Z",
+        buildRevision: () => {
+          const row = readTaskRow(tempDb, task.id);
+          capturedClaimJson = String(row["currentRevisionJson"]);
+          return Promise.resolve(result);
+        },
+      },
+    );
+
+    const updatedTask = getTaskById(tempDb.database, task.id);
+    const finalJson = JSON.parse(updatedTask!.currentRevisionJson!);
+    expect(finalJson.taskId).toBe(task.id);
+    expect(finalJson.status).toBe("REVIEWING");
+    expect(capturedClaimJson).not.toBeNull();
+    const claim = JSON.parse(capturedClaimJson!);
+    expect(claim.kind).toBe("DETERMINISTIC_REVISION_CLAIM");
+    expect(claim.claimId).toBe("exact-claim");
+  });
+
+  it("calls claim before builder and builder before finalize", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const order: string[] = [];
+
+    await executeRevisionForTask(
+      tempDb.database,
+      task.id,
+      { timeoutMs: 5000 },
+      {
+        createClaimId: () => "order-claim",
+        now: () => "2026-07-20T12:00:00.000Z",
+        buildRevision: () => {
+          const row = readTaskRow(tempDb, task.id);
+          const val = row["currentRevisionJson"];
+          if (val !== null && typeof val === "string" && val.includes("DETERMINISTIC_REVISION_CLAIM")) {
+            order.push("claim");
+          }
+          order.push("builder");
+          return Promise.resolve(createSuccessfulResult(task.id));
+        },
+      },
+    );
+
+    order.push("finalize");
+    expect(order).toEqual(["claim", "builder", "finalize"]);
+  });
+
+  it("only one of two concurrent callers acquires claim", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const secondDb = openDatabase(tempDb.databasePath);
+
+    try {
+      let builderACalled = false;
+      let builderBCalled = false;
+      let p2Started = false;
+
+      let resolveBuilderA: (() => void) | null = null;
+      const builderAPromise = new Promise<DeterministicRevisionResult>((resolve) => {
+        resolveBuilderA = () => resolve(createSuccessfulResult(task.id));
+      });
+
+      const p1 = executeRevisionForTask(
+        tempDb.database,
+        task.id,
+        { timeoutMs: 5000 },
+        {
+          createClaimId: () => "claim-a",
+          now: () => "2026-07-20T12:00:00.000Z",
+          buildRevision: () => {
+            builderACalled = true;
+            return builderAPromise;
+          },
+        },
+      );
+
+      await new Promise((r) => setTimeout(r, 20));
+
+      const p2 = executeRevisionForTask(
+        secondDb,
+        task.id,
+        { timeoutMs: 5000 },
+        {
+          createClaimId: () => "claim-b",
+          now: () => "2026-07-20T12:00:01.000Z",
+          beforeRevalidate: () => {
+            p2Started = true;
+          },
+          buildRevision: () => {
+            builderBCalled = true;
+            return Promise.resolve(createSuccessfulResult(task.id));
+          },
+        },
+      );
+
+      resolveBuilderA!();
+
+      const results = await Promise.allSettled([p1, p2]);
+      const fulfilled = results.filter((r) => r.status === "fulfilled");
+      const rejected = results.filter((r) => r.status === "rejected");
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+
+      const rejectedError = (rejected[0] as PromiseRejectedResult).reason;
+      expect(rejectedError).toBeInstanceOf(RevisionApplicationError);
+
+      expect(builderACalled).toBe(true);
+
+      const finalTask = getTaskById(tempDb.database, task.id);
+      expect(finalTask!.state).toBe("REVIEWING");
+    } finally {
+      secondDb.close();
+    }
+  });
+
+  it("throws REVISION_CONCURRENTLY_CHANGED when ownership is lost during build", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const secondDb = openDatabase(tempDb.databasePath);
+    initializeSchema(secondDb);
+
+    try {
+      let resolveBuilder: (() => void) | null = null;
+      const builderPromise = new Promise<DeterministicRevisionResult>((resolve) => {
+        resolveBuilder = () => resolve(createSuccessfulResult(task.id));
+      });
+
+      const p1 = executeRevisionForTask(
+        tempDb.database,
+        task.id,
+        { timeoutMs: 5000 },
+        {
+          createClaimId: () => "claim-build",
+          now: () => "2026-07-20T12:00:00.000Z",
+          buildRevision: () => builderPromise,
+        },
+      );
+
+      await new Promise((r) => setTimeout(r, 20));
+
+      secondDb
+        .prepare("UPDATE tasks SET currentRevisionJson = ?, updatedAt = ? WHERE id = ?")
+        .run(JSON.stringify({ stolen: true }), "2026-07-20T12:00:01.000Z", task.id);
+
+      resolveBuilder!();
+
+      await expect(p1).rejects.toThrow(RevisionApplicationError);
+
+      try {
+        await p1;
+      } catch (error) {
+        expect((error as RevisionApplicationError).code).toBe("REVISION_CONCURRENTLY_CHANGED");
+      }
+
+      const finalTask = getTaskById(tempDb.database, task.id);
+      expect(finalTask!.currentRevisionJson).toBe(JSON.stringify({ stolen: true }));
+    } finally {
+      secondDb.close();
+    }
+  });
+
+  it("throws REVISION_CONCURRENTLY_CHANGED when task is deleted during build", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const secondDb = openDatabase(tempDb.databasePath);
+    initializeSchema(secondDb);
+    secondDb.exec("PRAGMA foreign_keys = OFF;");
+
+    try {
+      let resolveBuilder: (() => void) | null = null;
+      const builderPromise = new Promise<DeterministicRevisionResult>((resolve) => {
+        resolveBuilder = () => resolve(createSuccessfulResult(task.id));
+      });
+
+      const p1 = executeRevisionForTask(
+        tempDb.database,
+        task.id,
+        { timeoutMs: 5000 },
+        {
+          createClaimId: () => "claim-delete",
+          now: () => "2026-07-20T12:00:00.000Z",
+          buildRevision: () => builderPromise,
+        },
+      );
+
+      await new Promise((r) => setTimeout(r, 20));
+
+      secondDb.prepare("DELETE FROM tasks WHERE id = ?").run(task.id);
+
+      resolveBuilder!();
+
+      await expect(p1).rejects.toThrow(RevisionApplicationError);
+
+      try {
+        await p1;
+      } catch (error) {
+        expect((error as RevisionApplicationError).code).toBe("REVISION_CONCURRENTLY_CHANGED");
+      }
+    } finally {
+      secondDb.close();
+    }
+  });
+
+  it("finalizes with REVIEWING on success", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const result = createSuccessfulResult(task.id);
+
+    await executeRevisionForTask(
+      tempDb.database,
+      task.id,
+      { timeoutMs: 5000 },
+      createDeps(result),
+    );
+
+    const updatedTask = getTaskById(tempDb.database, task.id);
+    expect(updatedTask!.state).toBe("REVIEWING");
+    const persisted = JSON.parse(updatedTask!.currentRevisionJson!);
+    expect(persisted.status).toBe("REVIEWING");
+    expect(persisted.taskId).toBe(task.id);
+  });
+
+  it("finalizes with REVISION_REQUIRED on failure", async () => {
+    tempDb = createTempDatabase();
+    const project = createTestProject(tempDb);
+    const task = createTestTask(tempDb, project.id, { state: "VERIFYING" });
+    createTestWorkspace(tempDb, task.id, { status: "READY" });
+    persistContract(tempDb, task.id);
+
+    const result = createFailingResult(task.id);
+
+    await executeRevisionForTask(
+      tempDb.database,
+      task.id,
+      { timeoutMs: 5000 },
+      createDeps(result),
+    );
+
+    const updatedTask = getTaskById(tempDb.database, task.id);
+    expect(updatedTask!.state).toBe("REVISION_REQUIRED");
+    const persisted = JSON.parse(updatedTask!.currentRevisionJson!);
+    expect(persisted.status).toBe("REVISION_REQUIRED");
+    expect(persisted.taskId).toBe(task.id);
   });
 });

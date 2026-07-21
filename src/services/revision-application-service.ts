@@ -1,12 +1,15 @@
 /// <reference types="node" />
 
+import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import { getProjectById } from "../repositories/project-repository.js";
 import {
+  claimTaskDeterministicRevision,
+  finalizeTaskDeterministicRevision,
   getTaskById,
   getTaskContract,
-  updateTaskState,
+  type DeterministicRevisionFinalState,
 } from "../repositories/task-repository.js";
 import { listTaskWorkspacesByTaskId } from "../repositories/task-workspace-repository.js";
 import {
@@ -19,6 +22,8 @@ import type { RequiredCommandRuntimeOptions } from "./required-command-runner.js
 export interface RevisionApplicationDeps {
   readonly beforeRevalidate?: () => void | Promise<void>;
   readonly buildRevision?: typeof buildDeterministicRevision;
+  readonly createClaimId?: () => string;
+  readonly now?: () => string;
 }
 
 export interface ExecuteRevisionForTaskResult {
@@ -36,7 +41,9 @@ export class RevisionApplicationError extends Error {
     | "NO_WORKSPACE"
     | "NO_CONTRACT"
     | "REVISION_PERSIST_FAILED"
-    | "REVISION_FAILED";
+    | "REVISION_FAILED"
+    | "REVISION_ALREADY_RUNNING"
+    | "REVISION_CONCURRENTLY_CHANGED";
 
   constructor(
     message: string,
@@ -163,44 +170,6 @@ function buildRevisionInput(
   };
 }
 
-function persistRevision(
-  database: DatabaseSync,
-  taskId: string,
-  result: DeterministicRevisionResult,
-): void {
-  let serialized: string;
-
-  try {
-    serialized = JSON.stringify(result);
-  } catch (error) {
-    throw new RevisionApplicationError(
-      "No se pudo serializar el resultado de revisión.",
-      { code: "REVISION_PERSIST_FAILED", cause: error },
-    );
-  }
-
-  const now = new Date().toISOString();
-
-  const updateResult = database
-    .prepare("UPDATE tasks SET currentRevisionJson = ?, updatedAt = ? WHERE id = ?")
-    .run(serialized, now, taskId);
-
-  if (updateResult.changes === 0) {
-    throw new RevisionApplicationError(
-      `No se pudo persistir la revisión para la tarea ${taskId}.`,
-      { code: "REVISION_PERSIST_FAILED" },
-    );
-  }
-}
-
-function getNextTaskState(
-  result: DeterministicRevisionResult,
-): DeterministicRevisionResult["status"] {
-  return result.status === "REVISION_REQUIRED"
-    ? "REVISION_REQUIRED"
-    : "REVIEWING";
-}
-
 export async function executeRevisionForTask(
   database: DatabaseSync,
   taskId: string,
@@ -210,19 +179,72 @@ export async function executeRevisionForTask(
   const { taskId: normalizedTaskId, projectId, workspaceId, input } =
     buildRevisionInput(database, taskId, runtime);
 
+  const taskBeforeHook = requireTask(database, normalizedTaskId);
+  const expectedCurrentRevisionJson = taskBeforeHook.currentRevisionJson;
+
   await deps?.beforeRevalidate?.();
 
   const latestTask = requireTask(database, normalizedTaskId);
   assertTaskIsVerifying(latestTask, normalizedTaskId);
 
+  const createClaimId = deps?.createClaimId ?? (() => randomUUID());
+  const nowFn = deps?.now ?? (() => new Date().toISOString());
+
+  const claimJson = JSON.stringify({
+    kind: "DETERMINISTIC_REVISION_CLAIM" as const,
+    claimId: createClaimId(),
+    taskId: normalizedTaskId,
+    claimedAt: nowFn(),
+  });
+
+  const claimed = claimTaskDeterministicRevision(
+    database,
+    normalizedTaskId,
+    expectedCurrentRevisionJson,
+    claimJson,
+    nowFn(),
+  );
+
+  if (!claimed) {
+    throw new RevisionApplicationError(
+      `No se pudo adquirir ownership de la revisión para la tarea ${normalizedTaskId}.`,
+      { code: "REVISION_ALREADY_RUNNING" },
+    );
+  }
+
   const buildRevision = deps?.buildRevision ?? buildDeterministicRevision;
 
   const result = await buildRevision(input);
 
-  persistRevision(database, normalizedTaskId, result);
+  let finalRevisionJson: string;
 
-  const now = new Date().toISOString();
-  updateTaskState(database, normalizedTaskId, getNextTaskState(result), now);
+  try {
+    finalRevisionJson = JSON.stringify(result);
+  } catch (error) {
+    throw new RevisionApplicationError(
+      "No se pudo serializar el resultado de revisión.",
+      { code: "REVISION_PERSIST_FAILED", cause: error },
+    );
+  }
+
+  const nextState: DeterministicRevisionFinalState =
+    result.status === "REVISION_REQUIRED" ? "REVISION_REQUIRED" : "REVIEWING";
+
+  const finalized = finalizeTaskDeterministicRevision(
+    database,
+    normalizedTaskId,
+    claimJson,
+    finalRevisionJson,
+    nextState,
+    nowFn(),
+  );
+
+  if (!finalized) {
+    throw new RevisionApplicationError(
+      `Ownership de revisión perdido o estado cambiado concurrentemente para la tarea ${normalizedTaskId}.`,
+      { code: "REVISION_CONCURRENTLY_CHANGED" },
+    );
+  }
 
   return {
     taskId: normalizedTaskId,
