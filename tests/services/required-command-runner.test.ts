@@ -131,6 +131,21 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+async function waitForProcessDeath(
+  pid: number,
+  deadlineMs = 2000,
+  pollMs = 20,
+): Promise<boolean> {
+  const deadline = performance.now() + deadlineMs;
+  while (performance.now() < deadline) {
+    if (!isProcessAlive(pid)) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return !isProcessAlive(pid);
+}
+
 describe("runRequiredCommands", () => {
   describe("input validation", () => {
     it("rejects empty workspacePath", async () => {
@@ -807,7 +822,8 @@ describe("runRequiredCommands", () => {
         expect(result.results[0].passed).toBe(false);
 
         if (childPid !== null && childPid > 0) {
-          expect(isProcessAlive(childPid)).toBe(false);
+          const dead = await waitForProcessDeath(childPid);
+          expect(dead).toBe(true);
         }
       } finally {
         const pidContent = await readFile(pidFile, "utf8").catch(() => "");
@@ -910,7 +926,8 @@ describe("runRequiredCommands", () => {
         const childPid = pidContent.trim() ? Number(pidContent.trim()) : null;
 
         if (childPid !== null && childPid > 0) {
-          expect(isProcessAlive(childPid)).toBe(false);
+          const dead = await waitForProcessDeath(childPid);
+          expect(dead).toBe(true);
         }
       } finally {
         const pidContent = await readFile(pidFile, "utf8").catch(() => "");

@@ -6,6 +6,23 @@ import type { Task, TaskContract, TaskState } from "../types.js";
 import { executableTaskContractSchema } from "../schemas/supervisor-result-schema.js";
 import { validateSupervisorResultSemantics } from "../services/supervisor-result-semantic-validator.js";
 
+export interface DeterministicRevisionClaim {
+  readonly kind: "DETERMINISTIC_REVISION_CLAIM";
+  readonly claimId: string;
+  readonly taskId: string;
+  readonly claimedAt: string;
+}
+
+export type DeterministicRevisionFinalState = "REVIEWING" | "REVISION_REQUIRED";
+
+function requireNonEmptyString(value: string, fieldName: string): string {
+  if (value.trim().length === 0) {
+    throw new Error(`${fieldName} no puede estar vacío.`);
+  }
+
+  return value;
+}
+
 function mapRowToTask(row: Record<string, unknown>): Task {
   return {
     id: String(row["id"]),
@@ -75,6 +92,77 @@ export function updateTaskState(
     .run(state, updatedAt, taskId);
 
   return getTaskById(database, taskId);
+}
+
+export function claimTaskDeterministicRevision(
+  database: DatabaseSync,
+  taskId: string,
+  expectedCurrentRevisionJson: string | null,
+  claimJson: string,
+  updatedAt: string,
+): boolean {
+  const id = requireNonEmptyString(taskId, "El id de la tarea");
+  const nextRevisionJson = requireNonEmptyString(claimJson, "claimJson");
+  const nextUpdatedAt = requireNonEmptyString(updatedAt, "updatedAt");
+
+  let result: { changes: number | bigint };
+
+  if (expectedCurrentRevisionJson === null) {
+    result = database
+      .prepare(
+        "UPDATE tasks SET currentRevisionJson = ?, updatedAt = ? WHERE id = ? AND state = 'VERIFYING' AND currentRevisionJson IS NULL",
+      )
+      .run(nextRevisionJson, nextUpdatedAt, id) as { changes: number | bigint };
+  } else {
+    const expectedRevisionJson = requireNonEmptyString(
+      expectedCurrentRevisionJson,
+      "expectedCurrentRevisionJson",
+    );
+
+    result = database
+      .prepare(
+        "UPDATE tasks SET currentRevisionJson = ?, updatedAt = ? WHERE id = ? AND state = 'VERIFYING' AND currentRevisionJson = ?",
+      )
+      .run(nextRevisionJson, nextUpdatedAt, id, expectedRevisionJson) as {
+        changes: number | bigint;
+      };
+  }
+
+  return Number(result.changes) === 1;
+}
+
+export function finalizeTaskDeterministicRevision(
+  database: DatabaseSync,
+  taskId: string,
+  expectedClaimJson: string,
+  finalRevisionJson: string,
+  nextState: DeterministicRevisionFinalState,
+  updatedAt: string,
+): boolean {
+  const id = requireNonEmptyString(taskId, "El id de la tarea");
+  const expectedRevisionJson = requireNonEmptyString(
+    expectedClaimJson,
+    "expectedClaimJson",
+  );
+  const nextRevisionJson = requireNonEmptyString(
+    finalRevisionJson,
+    "finalRevisionJson",
+  );
+  const nextUpdatedAt = requireNonEmptyString(updatedAt, "updatedAt");
+
+  if (nextState !== "REVIEWING" && nextState !== "REVISION_REQUIRED") {
+    throw new Error(`nextState inválido: ${String(nextState)}`);
+  }
+
+  const result = database
+    .prepare(
+      "UPDATE tasks SET currentRevisionJson = ?, state = ?, updatedAt = ? WHERE id = ? AND state = 'VERIFYING' AND currentRevisionJson = ?",
+    )
+    .run(nextRevisionJson, nextState, nextUpdatedAt, id, expectedRevisionJson) as {
+      changes: number | bigint;
+    };
+
+  return Number(result.changes) === 1;
 }
 
 export class PersistedTaskContractError extends Error {
