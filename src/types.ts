@@ -176,3 +176,51 @@ export interface CreateTaskWorkspaceInput {
   branchName: string;
   baseCommit: string;
 }
+
+export const TASK_REVIEW_STATUSES = ["RUNNING", "COMPLETED", "DISCARDED"] as const;
+
+export type TaskReviewStatus = (typeof TASK_REVIEW_STATUSES)[number];
+
+export const TASK_REVIEW_VERDICTS = ["APPROVED", "REVISION_REQUIRED"] as const;
+
+export type TaskReviewVerdict = (typeof TASK_REVIEW_VERDICTS)[number];
+
+export interface TaskReview {
+  id: string;
+  taskId: string;
+  reviewNumber: number;
+  runNumber: number;
+  status: TaskReviewStatus;
+  reviewerClaimJson: string | null;
+  snapshotWorkspaceId: string | null;
+  snapshotBaseCommit: string | null;
+  snapshotHeadCommit: string | null;
+  snapshotFingerprint: string | null;
+  verdict: TaskReviewVerdict | null;
+  summary: string | null;
+  findingsJson: string | null;
+  requiredChangesJson: string | null;
+  discardReason: string | null;
+  createdAt: string;
+  completedAt: string | null;
+  discardedAt: string | null;
+}
+
+export interface CreateTaskReviewInput {
+  id: string;
+  taskId: string;
+  reviewNumber: number;
+  runNumber: number;
+  reviewerClaimJson: string;
+  snapshotWorkspaceId: string;
+  snapshotBaseCommit: string;
+  snapshotHeadCommit: string;
+  snapshotFingerprint: string;
+}
+
+export interface CompleteTaskReviewInput {
+  verdict: TaskReviewVerdict;
+  summary: string;
+  findingsJson: string;
+  requiredChangesJson: string;
+}
