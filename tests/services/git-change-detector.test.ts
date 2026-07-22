@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import {
   detectGitChanges,
@@ -9,6 +12,10 @@ import {
   createTempGitRepository,
   type TempGitRepository,
 } from "../helpers/temp-git-repository.js";
+
+const H1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const H2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const SENTINEL = "0000000000000000000000000000000000000000";
 
 function createFile(repo: TempGitRepository, name: string, content: string): void {
   const fs = require("node:fs");
@@ -116,10 +123,14 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!.status).toBe("MODIFIED");
+      expect(result.changedFiles[0]!.path).toBe("file.txt");
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
         path: "file.txt",
         status: "MODIFIED",
-      });
+        previousMode: "100644",
+        currentMode: "100644",
+      }));
     });
 
     it("detects added and staged file", () => {
@@ -132,10 +143,11 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
         path: "new.txt",
         status: "ADDED",
-      });
+        currentMode: "100644",
+      }));
     });
 
     it("detects deleted file", () => {
@@ -150,10 +162,11 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
         path: "to-delete.txt",
         status: "DELETED",
-      });
+        previousMode: "100644",
+      }));
     });
 
     it("detects multiple files", () => {
@@ -188,10 +201,10 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
         path: "dir with spaces/file.txt",
         status: "MODIFIED",
-      });
+      }));
     });
 
     it("detects file with non-ASCII characters", () => {
@@ -206,10 +219,10 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
         path: "archivo-café.txt",
         status: "MODIFIED",
-      });
+      }));
     });
 
     it("detects rename with previousPath", () => {
@@ -224,11 +237,11 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
         path: "new-name.txt",
         status: "RENAMED",
         previousPath: "old-name.txt",
-      });
+      }));
     });
 
     it("preserves exact baseCommit in result", () => {
@@ -238,6 +251,226 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.baseCommit).toBe(baseCommit);
+    });
+  });
+
+  describe("mode detection", () => {
+    it("detects mode change 100644 to 100755", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "file.txt", "content");
+      repo.runGit(["add", "file.txt"]);
+      repo.runGit(["commit", "-m", "add file"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      const fs = require("node:fs");
+      const path = require("node:path");
+      fs.chmodSync(path.join(repo.path, "file.txt"), 0o755);
+      repo.runGit(["add", "file.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
+        path: "file.txt",
+        status: "MODIFIED",
+        previousMode: "100644",
+        currentMode: "100755",
+      }));
+    });
+
+    it("detects added executable file", () => {
+      repo = createTempGitRepository();
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "script.sh", "#!/bin/bash\necho hi");
+      repo.runGit(["add", "script.sh"]);
+      const fs = require("node:fs");
+      const path = require("node:path");
+      fs.chmodSync(path.join(repo.path, "script.sh"), 0o755);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
+        path: "script.sh",
+        status: "ADDED",
+        currentMode: "100755",
+      }));
+    });
+
+    it("detects added symlink", () => {
+      repo = createTempGitRepository();
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      const fs = require("node:fs");
+      const path = require("node:path");
+      fs.symlinkSync("target.txt", path.join(repo.path, "link.txt"));
+      repo.runGit(["add", "link.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
+        path: "link.txt",
+        status: "ADDED",
+        currentMode: "120000",
+      }));
+    });
+
+    it("detects mode change with rename", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "old.txt", "content");
+      repo.runGit(["add", "old.txt"]);
+      repo.runGit(["commit", "-m", "add file"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      repo.runGit(["mv", "old.txt", "new.txt"]);
+      const fs = require("node:fs");
+      const path = require("node:path");
+      fs.chmodSync(path.join(repo.path, "new.txt"), 0o755);
+      repo.runGit(["add", "new.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!).toEqual(expect.objectContaining({
+        path: "new.txt",
+        status: "RENAMED",
+        previousPath: "old.txt",
+        previousMode: "100644",
+        currentMode: "100755",
+      }));
+    });
+  });
+
+  describe("object ID detection", () => {
+    it("DELETED includes previousObjectId", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "file.txt", "content");
+      repo.runGit(["add", "file.txt"]);
+      repo.runGit(["commit", "-m", "init"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      repo.runGit(["rm", "file.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("DELETED");
+      expect(file).toEqual(expect.objectContaining({
+        previousObjectId: expect.stringMatching(/^[0-9a-f]{40}$/),
+      }));
+    });
+
+    it("RENAMED includes previousObjectId and similarityScore", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "old.txt", "content");
+      repo.runGit(["add", "old.txt"]);
+      repo.runGit(["commit", "-m", "init"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      repo.runGit(["mv", "old.txt", "new.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("RENAMED");
+      expect(file).toEqual(expect.objectContaining({
+        previousObjectId: expect.stringMatching(/^[0-9a-f]{40}$/),
+        similarityScore: 100,
+      }));
+    });
+
+    it("MODIFIED includes previousObjectId", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "file.txt", "content");
+      repo.runGit(["add", "file.txt"]);
+      repo.runGit(["commit", "-m", "init"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "file.txt", "changed");
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("MODIFIED");
+      expect(file).toEqual(expect.objectContaining({
+        previousObjectId: expect.stringMatching(/^[0-9a-f]{40}$/),
+      }));
+    });
+
+    it("object IDs are lowercase hex without zero sentinel", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "file.txt", "content");
+      repo.runGit(["add", "file.txt"]);
+      repo.runGit(["commit", "-m", "init"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "file.txt", "changed");
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      const file = result.changedFiles[0]!;
+      if (file.status === "MODIFIED") {
+        expect(file.previousObjectId).toMatch(/^[0-9a-f]{40}$/);
+        expect(file.previousObjectId).not.toBe("0".repeat(40));
+      }
+      if (file.status === "DELETED") {
+        expect(file.previousObjectId).toMatch(/^[0-9a-f]{40}$/);
+        expect(file.previousObjectId).not.toBe("0".repeat(40));
+      }
+    });
+
+    it("ADDED does not include currentObjectId", () => {
+      repo = createTempGitRepository();
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "new.txt", "content");
+      repo.runGit(["add", "new.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("ADDED");
+      expect("currentObjectId" in file).toBe(false);
+    });
+
+    it("MODIFIED does not include currentObjectId", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "file.txt", "content");
+      repo.runGit(["add", "file.txt"]);
+      repo.runGit(["commit", "-m", "init"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "file.txt", "changed");
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("MODIFIED");
+      expect("currentObjectId" in file).toBe(false);
+    });
+
+    it("RENAMED does not include currentObjectId", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "old.txt", "content");
+      repo.runGit(["add", "old.txt"]);
+      repo.runGit(["commit", "-m", "init"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      repo.runGit(["mv", "old.txt", "new.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("RENAMED");
+      expect("currentObjectId" in file).toBe(false);
     });
   });
 
@@ -251,9 +484,10 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!).toEqual({
         path: "untracked.txt",
         status: "UNTRACKED",
+        currentMode: "100644",
       });
     });
 
@@ -281,9 +515,10 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!).toEqual({
         path: "src/deep/nested/file.txt",
         status: "UNTRACKED",
+        currentMode: "100644",
       });
     });
 
@@ -296,9 +531,10 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       expect(result.changedFiles).toHaveLength(1);
-      expect(result.changedFiles[0]).toEqual({
+      expect(result.changedFiles[0]!).toEqual({
         path: "file with spaces.txt",
         status: "UNTRACKED",
+        currentMode: "100644",
       });
     });
 
@@ -319,6 +555,154 @@ describe("detectGitChanges", () => {
       expect(paths).not.toContain("ignored.log");
       expect(paths).toContain("not-ignored.txt");
     });
+
+    it("detects untracked executable file", () => {
+      repo = createTempGitRepository();
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "script.sh", "#!/bin/bash\necho hi");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      fs.chmodSync(path.join(repo.path, "script.sh"), 0o755);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!).toEqual({
+        path: "script.sh",
+        status: "UNTRACKED",
+        currentMode: "100755",
+      });
+    });
+
+    it("detects untracked symlink", () => {
+      repo = createTempGitRepository();
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      const fs = require("node:fs");
+      const path = require("node:path");
+      fs.symlinkSync("target.txt", path.join(repo.path, "link.txt"));
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!).toEqual({
+        path: "link.txt",
+        status: "UNTRACKED",
+        currentMode: "120000",
+      });
+    });
+
+    it("fails closed on lstat ENOENT", () => {
+      const tracked = "";
+      const untracked = "ghost.txt\0";
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+        if (callCount === 1) {
+          return { stdout: tracked, stderr: "", exitCode: 0, signal: null };
+        }
+        return { stdout: untracked, stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("INVALID_UNTRACKED_OUTPUT");
+      }
+    });
+
+    it("fails closed on lstat EACCES", () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "git-test-"));
+      const blockedDir = join(tmpDir, "blocked");
+      mkdirSync(blockedDir, { recursive: true, mode: 0o000 });
+      try {
+        const tracked = "";
+        const untracked = "blocked/secret.txt\0";
+        let callCount = 0;
+        const fakeRunGit = (): GitCommandResult => {
+          callCount += 1;
+          if (callCount === 1) {
+            return { stdout: tracked, stderr: "", exitCode: 0, signal: null };
+          }
+          return { stdout: untracked, stderr: "", exitCode: 0, signal: null };
+        };
+
+        try {
+          detectGitChanges(tmpDir, "abc123", { runGit: fakeRunGit });
+          expect.fail("Should have thrown");
+        } catch (error) {
+          expect(error).toBeInstanceOf(GitChangeDetectionError);
+          const err = error as GitChangeDetectionError;
+          expect(err.code).toBe("INVALID_UNTRACKED_OUTPUT");
+        }
+      } finally {
+        chmodSync(blockedDir, 0o755);
+        rmSync(tmpDir, { recursive: true });
+      }
+    });
+
+    it("fails closed on unsupported entry type (directory)", () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "git-test-"));
+      mkdirSync(join(tmpDir, "subdir"), { recursive: true });
+      try {
+        const tracked = "";
+        const untracked = "subdir\0";
+        let callCount = 0;
+        const fakeRunGit = (): GitCommandResult => {
+          callCount += 1;
+          if (callCount === 1) {
+            return { stdout: tracked, stderr: "", exitCode: 0, signal: null };
+          }
+          return { stdout: untracked, stderr: "", exitCode: 0, signal: null };
+        };
+
+        try {
+          detectGitChanges(tmpDir, "abc123", { runGit: fakeRunGit });
+          expect.fail("Should have thrown");
+        } catch (error) {
+          expect(error).toBeInstanceOf(GitChangeDetectionError);
+          const err = error as GitChangeDetectionError;
+          expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
+        }
+      } finally {
+        rmSync(tmpDir, { recursive: true });
+      }
+    });
+
+    it("detects untracked non-executable regular file", () => {
+      repo = createTempGitRepository();
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "regular.txt", "content");
+
+      const result = detectGitChanges(repo.path, baseCommit);
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!).toEqual({
+        path: "regular.txt",
+        status: "UNTRACKED",
+        currentMode: "100644",
+      });
+    });
+
+    it("detects untracked executable regular file", () => {
+      repo = createTempGitRepository();
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "script.sh", "#!/bin/bash");
+      chmodSync(join(repo.path, "script.sh"), 0o755);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!).toEqual({
+        path: "script.sh",
+        status: "UNTRACKED",
+        currentMode: "100755",
+      });
+    });
   });
 
   describe("tracked + untracked combined", () => {
@@ -338,8 +722,8 @@ describe("detectGitChanges", () => {
       const tracked = result.changedFiles.find((f) => f.path === "tracked.txt");
       const untracked = result.changedFiles.find((f) => f.path === "untracked.txt");
 
-      expect(tracked).toEqual({ path: "tracked.txt", status: "MODIFIED" });
-      expect(untracked).toEqual({ path: "untracked.txt", status: "UNTRACKED" });
+      expect(tracked).toEqual(expect.objectContaining({ path: "tracked.txt", status: "MODIFIED" }));
+      expect(untracked).toEqual({ path: "untracked.txt", status: "UNTRACKED", currentMode: "100644" });
     });
   });
 
@@ -384,7 +768,7 @@ describe("detectGitChanges", () => {
         callCount += 1;
         if (callCount === 1) {
           return {
-            stdout: "M\0b.txt\0M\0a.txt\0M\0z.txt\0",
+            stdout: `:100644 100644 ${H1} ${H2} M\0b.txt\0:100644 100644 ${H1} ${H2} M\0a.txt\0:100644 100644 ${H1} ${H2} M\0z.txt\0`,
             stderr: "",
             exitCode: 0,
             signal: null,
@@ -403,7 +787,7 @@ describe("detectGitChanges", () => {
         callCount += 1;
         if (callCount === 1) {
           return {
-            stdout: "M\0\u00e9.txt\0M\0\u00e0.txt\0",
+            stdout: `:100644 100644 ${H1} ${H2} M\0\u00e9.txt\0:100644 100644 ${H1} ${H2} M\0\u00e0.txt\0`,
             stderr: "",
             exitCode: 0,
             signal: null,
@@ -425,26 +809,26 @@ describe("detectGitChanges", () => {
     });
   });
 
-  describe("status mapping", () => {
-    it("previousPath only exists on RENAMED", () => {
+  describe("contract", () => {
+    it("ADDED has exactly: path, status, currentMode", () => {
       repo = createTempGitRepository();
-      createFile(repo, "file.txt", "content");
-      repo.runGit(["add", "file.txt"]);
-      repo.runGit(["commit", "-m", "add file"]);
       const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
 
-      createFile(repo, "file.txt", "changed");
+      createFile(repo, "new.txt", "content");
+      repo.runGit(["add", "new.txt"]);
 
       const result = detectGitChanges(repo.path, baseCommit);
 
-      expect(result.changedFiles[0]!.previousPath).toBeUndefined();
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("ADDED");
+      expect(Object.keys(file)).toEqual(["path", "status", "currentMode"]);
     });
 
-    it("no extra fields on ChangedFile", () => {
+    it("MODIFIED has exactly: path, status, previousMode, currentMode, previousObjectId", () => {
       repo = createTempGitRepository();
       createFile(repo, "file.txt", "content");
       repo.runGit(["add", "file.txt"]);
-      repo.runGit(["commit", "-m", "add file"]);
+      repo.runGit(["commit", "-m", "init"]);
       const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
 
       createFile(repo, "file.txt", "changed");
@@ -452,7 +836,53 @@ describe("detectGitChanges", () => {
       const result = detectGitChanges(repo.path, baseCommit);
 
       const file = result.changedFiles[0]!;
-      expect(Object.keys(file)).toEqual(["path", "status"]);
+      expect(file.status).toBe("MODIFIED");
+      expect(Object.keys(file)).toEqual(["path", "status", "previousMode", "currentMode", "previousObjectId"]);
+    });
+
+    it("DELETED has exactly: path, status, previousMode, previousObjectId", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "file.txt", "content");
+      repo.runGit(["add", "file.txt"]);
+      repo.runGit(["commit", "-m", "init"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      repo.runGit(["rm", "file.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("DELETED");
+      expect(Object.keys(file)).toEqual(["path", "status", "previousMode", "previousObjectId"]);
+    });
+
+    it("RENAMED has exactly: path, status, previousPath, previousMode, currentMode, previousObjectId, similarityScore", () => {
+      repo = createTempGitRepository();
+      createFile(repo, "old.txt", "content");
+      repo.runGit(["add", "old.txt"]);
+      repo.runGit(["commit", "-m", "init"]);
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      repo.runGit(["mv", "old.txt", "new.txt"]);
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("RENAMED");
+      expect(Object.keys(file)).toEqual(["path", "status", "previousPath", "previousMode", "currentMode", "previousObjectId", "similarityScore"]);
+    });
+
+    it("UNTRACKED has exactly: path, status, currentMode", () => {
+      repo = createTempGitRepository();
+      const baseCommit = repo.runGit(["rev-parse", "HEAD"]);
+
+      createFile(repo, "untracked.txt", "content");
+
+      const result = detectGitChanges(repo.path, baseCommit);
+
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("UNTRACKED");
+      expect(Object.keys(file)).toEqual(["path", "status", "currentMode"]);
     });
 
     it("changedFiles is readonly", () => {
@@ -503,7 +933,7 @@ describe("detectGitChanges", () => {
     });
 
     it("rejects unsupported status character", () => {
-      const fakeOutput = "X\0file.txt\0";
+      const fakeOutput = `:100644 100644 ${H1} ${H2} X\0file.txt\0`;
       let callCount = 0;
       const fakeRunGit = (): GitCommandResult => {
         callCount += 1;
@@ -526,7 +956,7 @@ describe("detectGitChanges", () => {
     });
 
     it("rejects copy status", () => {
-      const fakeOutput = "C100\0src.txt\0dst.txt\0";
+      const fakeOutput = `:100644 100644 ${H1} ${H2} C100\0src.txt\0dst.txt\0`;
       let callCount = 0;
       const fakeRunGit = (): GitCommandResult => {
         callCount += 1;
@@ -548,8 +978,95 @@ describe("detectGitChanges", () => {
       }
     });
 
-    it("rejects rename without both paths", () => {
-      const fakeOutput = "R100\0only-one-path\0";
+    it("rejects type change T", () => {
+      const fakeOutput = `:100644 120000 ${H1} ${H2} T\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("UNSUPPORTED_GIT_TYPE_CHANGE");
+      }
+    });
+
+    it("rejects unsupported mode 160000", () => {
+      const fakeOutput = `:160000 160000 ${H1} ${H2} M\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
+      }
+    });
+
+    it("rejects unsupported mode 999999", () => {
+      const fakeOutput = `:999999 100644 ${H1} ${H2} M\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
+      }
+    });
+
+    it("ADDED accepts raw output with zero object IDs (git working tree)", () => {
+      const fakeOutput = `:000000 100644 ${SENTINEL} ${SENTINEL} A\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      const result = detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+      expect(result.changedFiles).toHaveLength(1);
+      expect(result.changedFiles[0]!.status).toBe("ADDED");
+    });
+
+    it("rejects non-hex object ID", () => {
+      const fakeOutput = `:100644 100644 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz ${H2} M\0file.txt\0`;
       let callCount = 0;
       const fakeRunGit = (): GitCommandResult => {
         callCount += 1;
@@ -571,8 +1088,235 @@ describe("detectGitChanges", () => {
       }
     });
 
+    it("rejects object ID with 39 characters (too short for SHA-1)", () => {
+      const short = "a".repeat(39);
+      const fakeOutput = `:100644 100644 ${short} ${H2} M\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
+        expect(err.message).toContain("longitud");
+      }
+    });
+
+    it("rejects object ID with 41 characters (too long for SHA-1)", () => {
+      const long = "a".repeat(41);
+      const fakeOutput = `:100644 100644 ${long} ${H2} M\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
+        expect(err.message).toContain("longitud");
+      }
+    });
+
+    it("rejects object ID with 63 characters (too short for SHA-256)", () => {
+      const short64 = "a".repeat(63);
+      const fakeOutput = `:100644 100644 ${short64} ${H2} M\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
+        expect(err.message).toContain("longitud");
+      }
+    });
+
+    it("rejects object ID with 65 characters (too long for SHA-256)", () => {
+      const long64 = "a".repeat(65);
+      const fakeOutput = `:100644 100644 ${long64} ${H2} M\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
+        expect(err.message).toContain("longitud");
+      }
+    });
+
+    it("accepts valid 64-character hex object ID (SHA-256)", () => {
+      const id64 = "a".repeat(64);
+      const zeroSentinel64 = "0".repeat(64);
+      const fakeOutput = `:100644 100644 ${id64} ${zeroSentinel64} M\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      const result = detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+      expect(result.changedFiles).toHaveLength(1);
+      const file = result.changedFiles[0]!;
+      expect(file.status).toBe("MODIFIED");
+      expect(file).toEqual(expect.objectContaining({ previousObjectId: id64 }));
+      expect("currentObjectId" in file).toBe(false);
+    });
+
+    it("rejects zero sentinel as old object ID with 64 characters", () => {
+      const zero64 = "0".repeat(64);
+      const fakeOutput = `:100644 100644 ${zero64} ${H2} M\0file.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
+      }
+    });
+
+    it("rejects rename without both paths", () => {
+      const fakeOutput = `:100644 100644 ${H1} ${H2} R100\0only-one-path\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
+      }
+    });
+
+    it("rejects rename with invalid score R-1", () => {
+      const fakeOutput = `:100644 100644 ${H1} ${H2} R-1\0old.txt\0new.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
+      }
+    });
+
+    it("rejects rename with score > 100", () => {
+      const fakeOutput = `:100644 100644 ${H1} ${H2} R101\0old.txt\0new.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
+      }
+    });
+
+    it("rejects rename without score R", () => {
+      const fakeOutput = `:100644 100644 ${H1} ${H2} R\0old.txt\0new.txt\0`;
+      let callCount = 0;
+      const fakeRunGit = (): GitCommandResult => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+        }
+
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
+      };
+
+      try {
+        detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+        expect.fail("Should have thrown");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GitChangeDetectionError);
+        const err = error as GitChangeDetectionError;
+        expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
+      }
+    });
+
     it("rejects absolute path in tracked output", () => {
-      const fakeOutput = "M\0/absolute/path.txt\0";
+      const fakeOutput = `:100644 100644 ${H1} ${H2} M\0/absolute/path.txt\0`;
       let callCount = 0;
       const fakeRunGit = (): GitCommandResult => {
         callCount += 1;
@@ -595,7 +1339,7 @@ describe("detectGitChanges", () => {
     });
 
     it("rejects path with .. segment", () => {
-      const fakeOutput = "M\0../../etc/passwd\0";
+      const fakeOutput = `:100644 100644 ${H1} ${H2} M\0../../etc/passwd\0`;
       let callCount = 0;
       const fakeRunGit = (): GitCommandResult => {
         callCount += 1;
@@ -618,7 +1362,7 @@ describe("detectGitChanges", () => {
     });
 
     it("rejects path with ./ prefix", () => {
-      const fakeOutput = "M\0./file.txt\0";
+      const fakeOutput = `:100644 100644 ${H1} ${H2} M\0./file.txt\0`;
       let callCount = 0;
       const fakeRunGit = (): GitCommandResult => {
         callCount += 1;
@@ -641,7 +1385,7 @@ describe("detectGitChanges", () => {
     });
 
     it("rejects path with //", () => {
-      const fakeOutput = "M\0path//double\0";
+      const fakeOutput = `:100644 100644 ${H1} ${H2} M\0path//double\0`;
       let callCount = 0;
       const fakeRunGit = (): GitCommandResult => {
         callCount += 1;
@@ -664,8 +1408,7 @@ describe("detectGitChanges", () => {
     });
 
     it("rejects duplicate path", () => {
-      const tracked = "M\0file.txt\0";
-      const untracked = "file.txt\0";
+      const tracked = `:100644 100644 ${H1} ${H2} M\0file.txt\0:100644 100644 ${H1} ${H2} M\0file.txt\0`;
       let callCount = 0;
       const fakeRunGit = (): GitCommandResult => {
         callCount += 1;
@@ -674,7 +1417,7 @@ describe("detectGitChanges", () => {
           return { stdout: tracked, stderr: "", exitCode: 0, signal: null };
         }
 
-        return { stdout: untracked, stderr: "", exitCode: 0, signal: null };
+        return { stdout: "", stderr: "", exitCode: 0, signal: null };
       };
 
       try {
@@ -725,7 +1468,7 @@ describe("detectGitChanges", () => {
 
     describe("tracked output NUL strictness", () => {
       it("rejects tracked output not ending in NUL", () => {
-        const fakeOutput = "M\0file.txt";
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0file.txt`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -746,7 +1489,7 @@ describe("detectGitChanges", () => {
       });
 
       it("rejects tracked output with NUL duplicate (double NUL)", () => {
-        const fakeOutput = "M\0file.txt\0\0";
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0file.txt\0\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -767,175 +1510,7 @@ describe("detectGitChanges", () => {
       });
 
       it("rejects tracked output with intermediate empty token", () => {
-        const fakeOutput = "M\0\0file.txt\0";
-        let callCount = 0;
-        const fakeRunGit = (): GitCommandResult => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
-          }
-          return { stdout: "", stderr: "", exitCode: 0, signal: null };
-        };
-
-        try {
-          detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
-          expect.fail("Should have thrown");
-        } catch (error) {
-          expect(error).toBeInstanceOf(GitChangeDetectionError);
-          const err = error as GitChangeDetectionError;
-          expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
-        }
-      });
-    });
-
-    describe("tracked rename score validation", () => {
-      it("rejects R without score", () => {
-        const fakeOutput = "R\0old.txt\0new.txt\0";
-        let callCount = 0;
-        const fakeRunGit = (): GitCommandResult => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
-          }
-          return { stdout: "", stderr: "", exitCode: 0, signal: null };
-        };
-
-        try {
-          detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
-          expect.fail("Should have thrown");
-        } catch (error) {
-          expect(error).toBeInstanceOf(GitChangeDetectionError);
-          const err = error as GitChangeDetectionError;
-          expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
-        }
-      });
-
-      it("rejects Rabc (non-numeric score)", () => {
-        const fakeOutput = "Rabc\0old.txt\0new.txt\0";
-        let callCount = 0;
-        const fakeRunGit = (): GitCommandResult => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
-          }
-          return { stdout: "", stderr: "", exitCode: 0, signal: null };
-        };
-
-        try {
-          detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
-          expect.fail("Should have thrown");
-        } catch (error) {
-          expect(error).toBeInstanceOf(GitChangeDetectionError);
-          const err = error as GitChangeDetectionError;
-          expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
-        }
-      });
-
-      it("rejects R-1 (negative score)", () => {
-        const fakeOutput = "R-1\0old.txt\0new.txt\0";
-        let callCount = 0;
-        const fakeRunGit = (): GitCommandResult => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
-          }
-          return { stdout: "", stderr: "", exitCode: 0, signal: null };
-        };
-
-        try {
-          detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
-          expect.fail("Should have thrown");
-        } catch (error) {
-          expect(error).toBeInstanceOf(GitChangeDetectionError);
-          const err = error as GitChangeDetectionError;
-          expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
-        }
-      });
-
-      it("rejects R101 (score > 100)", () => {
-        const fakeOutput = "R101\0old.txt\0new.txt\0";
-        let callCount = 0;
-        const fakeRunGit = (): GitCommandResult => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
-          }
-          return { stdout: "", stderr: "", exitCode: 0, signal: null };
-        };
-
-        try {
-          detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
-          expect.fail("Should have thrown");
-        } catch (error) {
-          expect(error).toBeInstanceOf(GitChangeDetectionError);
-          const err = error as GitChangeDetectionError;
-          expect(err.code).toBe("UNSUPPORTED_GIT_STATUS");
-        }
-      });
-
-      it("accepts R0 (minimum valid score)", () => {
-        const fakeOutput = "R0\0old.txt\0new.txt\0";
-        let callCount = 0;
-        const fakeRunGit = (): GitCommandResult => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
-          }
-          return { stdout: "", stderr: "", exitCode: 0, signal: null };
-        };
-
-        const result = detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
-        expect(result.changedFiles).toHaveLength(1);
-        expect(result.changedFiles[0]).toEqual({
-          path: "new.txt",
-          status: "RENAMED",
-          previousPath: "old.txt",
-        });
-      });
-
-      it("accepts R100 (maximum valid score)", () => {
-        const fakeOutput = "R100\0old.txt\0new.txt\0";
-        let callCount = 0;
-        const fakeRunGit = (): GitCommandResult => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
-          }
-          return { stdout: "", stderr: "", exitCode: 0, signal: null };
-        };
-
-        const result = detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
-        expect(result.changedFiles).toHaveLength(1);
-        expect(result.changedFiles[0]).toEqual({
-          path: "new.txt",
-          status: "RENAMED",
-          previousPath: "old.txt",
-        });
-      });
-
-      it("rejects rename truncated without previousPath", () => {
-        const fakeOutput = "R100\0new.txt\0";
-        let callCount = 0;
-        const fakeRunGit = (): GitCommandResult => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
-          }
-          return { stdout: "", stderr: "", exitCode: 0, signal: null };
-        };
-
-        try {
-          detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
-          expect.fail("Should have thrown");
-        } catch (error) {
-          expect(error).toBeInstanceOf(GitChangeDetectionError);
-          const err = error as GitChangeDetectionError;
-          expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
-        }
-      });
-
-      it("rejects rename truncated without destination path", () => {
-        const fakeOutput = "R100\0old.txt\0";
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0\0file.txt\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1024,7 +1599,7 @@ describe("detectGitChanges", () => {
           if (callCount === 1) {
             return { stdout: "", stderr: "", exitCode: 0, signal: null };
           }
-          return { stdout: "/absolute/path\0", stderr: "", exitCode: 0, signal: null };
+          return { stdout: "/absolute\0", stderr: "", exitCode: 0, signal: null };
         };
 
         try {
@@ -1040,7 +1615,7 @@ describe("detectGitChanges", () => {
 
     describe("path validation edge cases", () => {
       it("rejects path '.'", () => {
-        const fakeOutput = "M\0.\0";
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0.\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1061,7 +1636,7 @@ describe("detectGitChanges", () => {
       });
 
       it("rejects path with backslash", () => {
-        const fakeOutput = "M\0dir\\file.txt\0";
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0dir\\file.txt\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1082,7 +1657,7 @@ describe("detectGitChanges", () => {
       });
 
       it("rejects path with trailing slash", () => {
-        const fakeOutput = "M\0dir/\0";
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0dir/\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1103,7 +1678,7 @@ describe("detectGitChanges", () => {
       });
 
       it("accepts path with . segment (dir/./file)", () => {
-        const fakeOutput = "M\0dir/./file.txt\0";
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0dir/./file.txt\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1119,7 +1694,7 @@ describe("detectGitChanges", () => {
       });
 
       it("rejects path with .. segment (a/../b)", () => {
-        const fakeOutput = "M\0a/../b/file.txt\0";
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0a/../b/file.txt\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1139,8 +1714,50 @@ describe("detectGitChanges", () => {
         }
       });
 
-      it("accepts path with newline", () => {
-        const fakeOutput = "M\0file\nname.txt\0";
+      it("rejects path with backslash + n (not a Git escape in raw format)", () => {
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0file\\nname.txt\0`;
+        let callCount = 0;
+        const fakeRunGit = (): GitCommandResult => {
+          callCount += 1;
+          if (callCount === 1) {
+            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+          }
+          return { stdout: "", stderr: "", exitCode: 0, signal: null };
+        };
+
+        try {
+          detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+          expect.fail("Should have thrown");
+        } catch (error) {
+          expect(error).toBeInstanceOf(GitChangeDetectionError);
+          const err = error as GitChangeDetectionError;
+          expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
+        }
+      });
+
+      it("rejects path with backslash + t (not a Git escape in raw format)", () => {
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0file\\tname.txt\0`;
+        let callCount = 0;
+        const fakeRunGit = (): GitCommandResult => {
+          callCount += 1;
+          if (callCount === 1) {
+            return { stdout: fakeOutput, stderr: "", exitCode: 0, signal: null };
+          }
+          return { stdout: "", stderr: "", exitCode: 0, signal: null };
+        };
+
+        try {
+          detectGitChanges("/repo", "abc123", { runGit: fakeRunGit });
+          expect.fail("Should have thrown");
+        } catch (error) {
+          expect(error).toBeInstanceOf(GitChangeDetectionError);
+          const err = error as GitChangeDetectionError;
+          expect(err.code).toBe("INVALID_TRACKED_OUTPUT");
+        }
+      });
+
+      it("accepts path with literal newline character", () => {
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0file\nname.txt\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1155,8 +1772,8 @@ describe("detectGitChanges", () => {
         expect(result.changedFiles[0]!.path).toBe("file\nname.txt");
       });
 
-      it("accepts path with tab", () => {
-        const fakeOutput = "M\0file\tname.txt\0";
+      it("accepts path with literal tab character", () => {
+        const fakeOutput = `:100644 100644 ${H1} ${H2} M\0file\tname.txt\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1174,7 +1791,7 @@ describe("detectGitChanges", () => {
 
     describe("error strengthening", () => {
       it("tracked parser error: correct class, name, code, message, no wrapper", () => {
-        const fakeOutput = "X\0file.txt\0";
+        const fakeOutput = `:${SENTINEL} ${H1} ${SENTINEL} ${H1} X\0file.txt\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1221,7 +1838,7 @@ describe("detectGitChanges", () => {
       });
 
       it("tracked parser does not run untracked command on error", () => {
-        const fakeOutput = "X\0file.txt\0";
+        const fakeOutput = `:${SENTINEL} ${H1} ${SENTINEL} ${H1} X\0file.txt\0`;
         let callCount = 0;
         const fakeRunGit = (): GitCommandResult => {
           callCount += 1;
@@ -1237,7 +1854,7 @@ describe("detectGitChanges", () => {
       });
 
       it("error does not mutate injected output", () => {
-        const trackedOutput = "X\0file.txt\0";
+        const trackedOutput = `:${SENTINEL} ${H1} ${SENTINEL} ${H1} X\0file.txt\0`;
         const untrackedOutput = "file.txt\0";
         const trackedRef = trackedOutput;
         const untrackedRef = untrackedOutput;

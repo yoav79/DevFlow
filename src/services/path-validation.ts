@@ -196,7 +196,7 @@ function validateFile(
     );
     violations.push(...destViolations);
   } else {
-    if (file.previousPath !== undefined) {
+    if ("previousPath" in file && file.previousPath !== undefined) {
       throw new PathConfigError(
         `ChangedFile con status ${file.status} tiene previousPath inesperado.`,
         { code: "INVALID_ALLOWED_PATH", value: file.path },

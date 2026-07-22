@@ -8,20 +8,39 @@ import type {
   PathViolation,
   PathValidationResult,
 } from "../../src/services/path-validation.js";
-import type { ChangedFile } from "../../src/services/git-change-detector.js";
+import type { ChangedFile, ChangedFileStatus, GitFileMode } from "../../src/services/git-change-detector.js";
 
-function file(path: string, status: ChangedFile["status"]): ChangedFile {
+const PLACEHOLDER_HASH = "a".repeat(40);
+
+function file(path: string, status: ChangedFileStatus): ChangedFile {
   if (status === "RENAMED") {
     throw new Error("Use fileRenamed for RENAMED status");
   }
-  return { path, status };
+  if (status === "ADDED") {
+    return { path, status: "ADDED", currentMode: "100644" };
+  }
+  if (status === "MODIFIED") {
+    return { path, status: "MODIFIED", previousMode: "100644", currentMode: "100644", previousObjectId: PLACEHOLDER_HASH };
+  }
+  if (status === "DELETED") {
+    return { path, status: "DELETED", previousMode: "100644", previousObjectId: PLACEHOLDER_HASH };
+  }
+  return { path, status: "UNTRACKED", currentMode: "100644" };
 }
 
 function fileRenamed(
   previousPath: string,
   path: string,
 ): ChangedFile {
-  return { path, status: "RENAMED", previousPath };
+  return {
+    path,
+    status: "RENAMED",
+    previousPath,
+    previousMode: "100644",
+    currentMode: "100644",
+    previousObjectId: PLACEHOLDER_HASH,
+    similarityScore: 100,
+  };
 }
 
 describe("validateChangedPaths", () => {

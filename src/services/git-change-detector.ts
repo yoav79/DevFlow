@@ -1,6 +1,8 @@
 /// <reference types="node" />
 
 import { spawnSync } from "node:child_process";
+import { lstatSync } from "node:fs";
+import { join } from "node:path";
 
 const MAX_STDERR_PREVIEW = 200;
 
@@ -11,11 +13,51 @@ export type ChangedFileStatus =
   | "RENAMED"
   | "UNTRACKED";
 
-export interface ChangedFile {
+export type GitFileMode = "100644" | "100755" | "120000";
+
+export interface ChangedFileAdded {
   readonly path: string;
-  readonly status: ChangedFileStatus;
-  readonly previousPath?: string;
+  readonly status: "ADDED";
+  readonly currentMode: GitFileMode;
 }
+
+export interface ChangedFileModified {
+  readonly path: string;
+  readonly status: "MODIFIED";
+  readonly previousMode: GitFileMode;
+  readonly currentMode: GitFileMode;
+  readonly previousObjectId: string;
+}
+
+export interface ChangedFileDeleted {
+  readonly path: string;
+  readonly status: "DELETED";
+  readonly previousMode: GitFileMode;
+  readonly previousObjectId: string;
+}
+
+export interface ChangedFileRenamed {
+  readonly path: string;
+  readonly status: "RENAMED";
+  readonly previousPath: string;
+  readonly previousMode: GitFileMode;
+  readonly currentMode: GitFileMode;
+  readonly previousObjectId: string;
+  readonly similarityScore: number;
+}
+
+export interface ChangedFileUntracked {
+  readonly path: string;
+  readonly status: "UNTRACKED";
+  readonly currentMode: GitFileMode;
+}
+
+export type ChangedFile =
+  | ChangedFileAdded
+  | ChangedFileModified
+  | ChangedFileDeleted
+  | ChangedFileRenamed
+  | ChangedFileUntracked;
 
 export interface GitChangeDetectionResult {
   readonly baseCommit: string;
@@ -30,6 +72,7 @@ export type GitChangeDetectionErrorCode =
   | "INVALID_TRACKED_OUTPUT"
   | "INVALID_UNTRACKED_OUTPUT"
   | "UNSUPPORTED_GIT_STATUS"
+  | "UNSUPPORTED_GIT_TYPE_CHANGE"
   | "DUPLICATE_CHANGED_PATH";
 
 export class GitChangeDetectionError extends Error {
@@ -170,34 +213,52 @@ function throwGitCommandFailed(
   );
 }
 
-function isSupportedStatus(status: string): boolean {
-  return status === "A" || status === "M" || status === "D";
-}
-
-function isRenameStatus(status: string): boolean {
-  return status.startsWith("R");
-}
-
-function isValidRenameScore(status: string): boolean {
-  if (!status.startsWith("R")) {
-    return false;
+function validateGitMode(
+  mode: string,
+  label: string,
+): GitFileMode {
+  if (mode === "100644" || mode === "100755" || mode === "120000") {
+    return mode;
   }
 
-  const scoreStr = status.slice(1);
+  throw new GitChangeDetectionError(
+    `${label}: modo Git no soportado: ${mode}`,
+    { code: "UNSUPPORTED_GIT_STATUS" },
+  );
+}
 
-  if (scoreStr.length === 0) {
-    return false;
+function validateObjectId(
+  id: string,
+  label: string,
+): void {
+  if (!/^[0-9a-f]+$/.test(id)) {
+    throw new GitChangeDetectionError(
+      `${label}: object ID inválido (no es hexadecimal lowercase): ${id}`,
+      { code: "INVALID_TRACKED_OUTPUT" },
+    );
   }
 
-  for (let i = 0; i < scoreStr.length; i++) {
-    const ch = scoreStr.charCodeAt(i);
-    if (ch < 48 || ch > 57) {
-      return false;
+  if (id.length !== 40 && id.length !== 64) {
+    throw new GitChangeDetectionError(
+      `${label}: object ID longitud inválida (${id.length} chars, esperado 40 o 64).`,
+      { code: "INVALID_TRACKED_OUTPUT" },
+    );
+  }
+
+  let allZero = true;
+  for (let j = 0; j < id.length; j++) {
+    if (id.charCodeAt(j) !== 48) {
+      allZero = false;
+      break;
     }
   }
 
-  const score = Number(scoreStr);
-  return score >= 0 && score <= 100;
+  if (allZero) {
+    throw new GitChangeDetectionError(
+      `${label}: object ID es sentinel de ceros.`,
+      { code: "INVALID_TRACKED_OUTPUT" },
+    );
+  }
 }
 
 function validateChangedPath(
@@ -272,7 +333,7 @@ function validateChangedPath(
   }
 }
 
-function parseTrackedOutput(tracked: string): ChangedFile[] {
+function parseRawOutput(tracked: string): ChangedFile[] {
   const result: ChangedFile[] = [];
 
   if (tracked.length === 0) {
@@ -311,32 +372,84 @@ function parseTrackedOutput(tracked: string): ChangedFile[] {
       );
     }
 
-    const statusChar = token[0]!;
+    const parts = token.split(" ");
 
-    if (isRenameStatus(statusChar)) {
-      if (!isValidRenameScore(token)) {
+    if (parts.length === 1 && token.startsWith(":")) {
+      i++;
+      continue;
+    }
+
+    if (parts.length < 5 || !parts[0]!.startsWith(":")) {
+      throw new GitChangeDetectionError(
+        `Registro raw inválido: ${token}`,
+        { code: "INVALID_TRACKED_OUTPUT" },
+      );
+    }
+
+    const statusToken = parts[4]!;
+    const statusChar = statusToken[0]!;
+
+    if (statusChar === "T") {
+      throw new GitChangeDetectionError(
+        `Cambio de tipo no soportado: ${token}`,
+        { code: "UNSUPPORTED_GIT_TYPE_CHANGE" },
+      );
+    }
+
+    if (statusChar === "C") {
+      throw new GitChangeDetectionError(
+        `Status de copy no soportado: ${token}`,
+        { code: "UNSUPPORTED_GIT_STATUS" },
+      );
+    }
+
+    if (statusChar === "R") {
+      const scoreStr = statusToken.slice(1);
+      if (scoreStr.length === 0) {
         throw new GitChangeDetectionError(
-          `Status de rename inválido: ${token}`,
+          `Status de rename sin score: ${token}`,
+          { code: "UNSUPPORTED_GIT_STATUS" },
+        );
+      }
+      for (let j = 0; j < scoreStr.length; j++) {
+        const ch = scoreStr.charCodeAt(j);
+        if (ch < 48 || ch > 57) {
+          throw new GitChangeDetectionError(
+            `Score de rename inválido: ${token}`,
+            { code: "UNSUPPORTED_GIT_STATUS" },
+          );
+        }
+      }
+      const score = Number(scoreStr);
+      if (score < 0 || score > 100) {
+        throw new GitChangeDetectionError(
+          `Score de rename fuera de rango: ${token}`,
           { code: "UNSUPPORTED_GIT_STATUS" },
         );
       }
 
-      if (statusChar === "C") {
-        throw new GitChangeDetectionError(
-          `Status de copy no soportado: ${token}`,
-          { code: "UNSUPPORTED_GIT_STATUS" },
-        );
-      }
+      const oldModeStr = parts[0]!.slice(1);
+      const newModeStr = parts[1]!;
+      const oldObjectId = parts[2]!;
+      const newObjectId = parts[3]!;
 
       const previousPath = tokens[i + 1];
       const newPath = tokens[i + 2];
 
-      if (previousPath === undefined || newPath === undefined) {
+      if (
+        oldModeStr === undefined || newModeStr === undefined ||
+        oldObjectId === undefined || newObjectId === undefined ||
+        previousPath === undefined || newPath === undefined
+      ) {
         throw new GitChangeDetectionError(
-          `Rename incompleto: se esperaban dos paths después de ${token}`,
+          `Registro rename incompleto: ${token}`,
           { code: "INVALID_TRACKED_OUTPUT" },
         );
       }
+
+      const previousMode = validateGitMode(oldModeStr, "previousMode");
+      const currentMode = validateGitMode(newModeStr, "currentMode");
+      validateObjectId(oldObjectId, "previousObjectId");
 
       if (previousPath.length === 0 || newPath.length === 0) {
         throw new GitChangeDetectionError(
@@ -352,44 +465,74 @@ function parseTrackedOutput(tracked: string): ChangedFile[] {
         path: newPath,
         status: "RENAMED",
         previousPath,
+        previousMode,
+        currentMode,
+        previousObjectId: oldObjectId,
+        similarityScore: score,
       });
 
       i += 3;
       continue;
     }
 
-    if (!isSupportedStatus(statusChar)) {
+    if (statusChar !== "A" && statusChar !== "M" && statusChar !== "D") {
       throw new GitChangeDetectionError(
         `Status no soportado: ${token}`,
         { code: "UNSUPPORTED_GIT_STATUS" },
       );
     }
 
+    const oldModeStr = parts[0]!.slice(1);
+    const newModeStr = parts[1]!;
+    const oldObjectId = parts[2]!;
+    const newObjectId = parts[3]!;
+
     const filePath = tokens[i + 1];
 
-    if (filePath === undefined) {
+    if (
+      oldModeStr === undefined || newModeStr === undefined ||
+      oldObjectId === undefined || newObjectId === undefined ||
+      filePath === undefined
+    ) {
       throw new GitChangeDetectionError(
-        `Path faltante para status ${statusChar}`,
+        `Registro incompleto para status ${statusChar}: ${token}`,
         { code: "INVALID_TRACKED_OUTPUT" },
       );
     }
 
     validateChangedPath(filePath, "path", "INVALID_TRACKED_OUTPUT");
 
-    let fileStatus: ChangedFileStatus;
-
     if (statusChar === "A") {
-      fileStatus = "ADDED";
-    } else if (statusChar === "M") {
-      fileStatus = "MODIFIED";
-    } else {
-      fileStatus = "DELETED";
-    }
+      const currentMode = validateGitMode(newModeStr, "currentMode");
 
-    result.push({
-      path: filePath,
-      status: fileStatus,
-    });
+      result.push({
+        path: filePath,
+        status: "ADDED",
+        currentMode,
+      });
+    } else if (statusChar === "M") {
+      const previousMode = validateGitMode(oldModeStr, "previousMode");
+      const currentMode = validateGitMode(newModeStr, "currentMode");
+      validateObjectId(oldObjectId, "previousObjectId");
+
+      result.push({
+        path: filePath,
+        status: "MODIFIED",
+        previousMode,
+        currentMode,
+        previousObjectId: oldObjectId,
+      });
+    } else {
+      const previousMode = validateGitMode(oldModeStr, "previousMode");
+      validateObjectId(oldObjectId, "previousObjectId");
+
+      result.push({
+        path: filePath,
+        status: "DELETED",
+        previousMode,
+        previousObjectId: oldObjectId,
+      });
+    }
 
     i += 2;
   }
@@ -397,7 +540,36 @@ function parseTrackedOutput(tracked: string): ChangedFile[] {
   return result;
 }
 
-function parseUntrackedOutput(untracked: string): ChangedFile[] {
+function determineUntrackedMode(fullPath: string): GitFileMode {
+  let stats;
+  try {
+    stats = lstatSync(fullPath);
+  } catch (error) {
+    throw new GitChangeDetectionError(
+      `No se pudo obtener metadata de untracked: ${fullPath}`,
+      { code: "INVALID_UNTRACKED_OUTPUT", cause: error },
+    );
+  }
+
+  if (stats.isSymbolicLink()) {
+    return "120000";
+  }
+
+  if (!stats.isFile()) {
+    throw new GitChangeDetectionError(
+      `Tipo de entrada no soportado para untracked: ${fullPath} (mode: ${stats.mode})`,
+      { code: "UNSUPPORTED_GIT_STATUS" },
+    );
+  }
+
+  const isExecutable = (stats.mode & 0o111) !== 0;
+  return isExecutable ? "100755" : "100644";
+}
+
+function parseUntrackedOutput(
+  untracked: string,
+  workspacePath: string,
+): ChangedFile[] {
   const result: ChangedFile[] = [];
 
   if (untracked.length === 0) {
@@ -434,9 +606,13 @@ function parseUntrackedOutput(untracked: string): ChangedFile[] {
 
     validateChangedPath(token, "untracked path", "INVALID_UNTRACKED_OUTPUT");
 
+    const fullPath = join(workspacePath, token);
+    const currentMode = determineUntrackedMode(fullPath);
+
     result.push({
       path: token,
       status: "UNTRACKED",
+      currentMode,
     });
   }
 
@@ -470,8 +646,8 @@ function sortChangedFiles(files: ChangedFile[]): readonly ChangedFile[] {
       return statusCmp;
     }
 
-    const prevA = a.previousPath ?? "";
-    const prevB = b.previousPath ?? "";
+    const prevA = "previousPath" in a ? a.previousPath : "";
+    const prevB = "previousPath" in b ? b.previousPath : "";
     return compareLexicographic(prevA, prevB);
   });
 }
@@ -497,10 +673,11 @@ export function detectGitChanges(
 
   const runGit = deps?.runGit ?? runGitSync;
 
-  const trackedArgs = [
+  const trackedCommandArgs = [
     "diff",
-    "--name-status",
+    "--raw",
     "-z",
+    "--no-abbrev",
     "--find-renames=50%",
     baseCommit,
     "--",
@@ -509,20 +686,20 @@ export function detectGitChanges(
   let trackedResult: GitCommandResult;
 
   try {
-    trackedResult = runGit(workspacePath, trackedArgs);
+    trackedResult = runGit(workspacePath, trackedCommandArgs);
   } catch (error) {
-    throwGitNotfound(trackedArgs, error);
+    throwGitNotfound(trackedCommandArgs, error);
   }
 
   if (trackedResult.error !== undefined) {
-    throwGitNotfound(trackedArgs, trackedResult.error);
+    throwGitNotfound(trackedCommandArgs, trackedResult.error);
   }
 
   if (trackedResult.exitCode !== 0) {
-    throwGitCommandFailed(trackedArgs, trackedResult);
+    throwGitCommandFailed(trackedCommandArgs, trackedResult);
   }
 
-  const tracked = parseTrackedOutput(trackedResult.stdout);
+  const tracked = parseRawOutput(trackedResult.stdout);
 
   const untrackedArgs = [
     "ls-files",
@@ -548,7 +725,7 @@ export function detectGitChanges(
     throwGitCommandFailed(untrackedArgs, untrackedResult);
   }
 
-  const untracked = parseUntrackedOutput(untrackedResult.stdout);
+  const untracked = parseUntrackedOutput(untrackedResult.stdout, workspacePath);
 
   const allFiles = [...tracked, ...untracked];
 
