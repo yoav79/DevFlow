@@ -8,9 +8,12 @@ import {
   updateTaskWorkspaceStatus,
 } from "../../src/repositories/task-workspace-repository.js";
 import {
+  assertReviewerEvidenceSnapshotStillOwned,
   claimReviewerRun,
+  loadReviewerEvidenceSnapshot,
   ReviewerClaimError,
   type ClaimReviewerRunInput,
+  type ReviewerEvidenceSnapshot,
 } from "../../src/services/reviewer-claim-service.js";
 import type { Project, Task, TaskWorkspace } from "../../src/types.js";
 import { createTempDatabase, type TempDatabase } from "../helpers/temp-database.js";
@@ -92,6 +95,37 @@ function defaultClaimInput(overrides: Partial<ClaimReviewerRunInput> = {}): Clai
   };
 }
 
+const CONTRACT_JSON = '{"classification":"EXECUTABLE_TASK","objective":"Implement","context":"Context","acceptanceCriteria":["Works"],"allowedPaths":["src"],"forbiddenPaths":[],"requiredCommands":[],"assumptions":[],"risks":[],"summary":"Summary","reasoning":"Reasoning","openQuestions":[]}';
+const REVISION_JSON = '{"taskId":"task-1","projectId":"proj-1","workspaceId":"ws-task-1","baseCommit":"abc123def456","changedFiles":[],"pathValidation":{"passed":true,"violations":[]},"commandsResult":null,"status":"REVIEWING","generatedAt":"2026-07-22T00:00:00.000Z"}';
+const CLAIM_JSON = '{"kind":"REVIEWER_CLAIM","agent":"reviewer-a"}';
+
+let tempDb: TempDatabase | null = null;
+
+function createClaimedEvidenceSnapshotFixture(): ReviewerEvidenceSnapshot {
+  tempDb = createTempDatabase();
+  const project = createTestProject(tempDb);
+  const task = createTestTask(tempDb, project.id, {
+    contractJson: CONTRACT_JSON,
+    currentRevisionJson: REVISION_JSON,
+  });
+  const workspace = createReadyWorkspace(tempDb, task.id, { id: "ws-task-1" });
+
+  claimReviewerRun(tempDb.database, defaultClaimInput({
+    taskId: task.id,
+    workspaceId: workspace.id,
+    reviewerClaimJson: CLAIM_JSON,
+    snapshotBaseCommit: workspace.baseCommit,
+    snapshotHeadCommit: "head-commit-123",
+    snapshotFingerprint: "fingerprint-123",
+  }));
+
+  return loadReviewerEvidenceSnapshot(tempDb.database, {
+    taskId: task.id,
+    reviewId: "review-1",
+    expectedReviewerClaimJson: CLAIM_JSON,
+  });
+}
+
 function expectReviewerClaimError(
   callback: () => unknown,
   expectedCode: string,
@@ -116,8 +150,6 @@ function readReviewCount(tempDb: TempDatabase, taskId: string): number {
 }
 
 describe("reviewer-claim-service", () => {
-  let tempDb: TempDatabase | null = null;
-
   afterEach(() => {
     tempDb?.cleanup();
     tempDb = null;
@@ -728,6 +760,408 @@ describe("reviewer-claim-service", () => {
       }));
 
       expect(result.status).toBe("RUNNING");
+    });
+  });
+
+  describe("ReviewerEvidenceSnapshot read-only API", () => {
+    function loadSnapshot(): ReviewerEvidenceSnapshot {
+      return loadReviewerEvidenceSnapshot(tempDb!.database, {
+        taskId: "task-1",
+        reviewId: "review-1",
+        expectedReviewerClaimJson: CLAIM_JSON,
+      });
+    }
+
+    function expectSnapshotError(callback: () => unknown, expectedCode: string): ReviewerClaimError {
+      return expectReviewerClaimError(callback, expectedCode);
+    }
+
+    function disableChecksForCorruption(): void {
+      tempDb!.database.exec("PRAGMA ignore_check_constraints = ON;");
+    }
+
+    function enableChecksAfterCorruption(): void {
+      tempDb!.database.exec("PRAGMA ignore_check_constraints = OFF;");
+    }
+
+    function updateReviewField(fieldName: string, value: string | number | null): void {
+      tempDb!.database.prepare(`UPDATE task_reviews SET ${fieldName} = ? WHERE id = ?`).run(value, "review-1");
+    }
+
+    function updateTaskField(fieldName: string, value: string | null): void {
+      tempDb!.database.prepare(`UPDATE tasks SET ${fieldName} = ? WHERE id = ?`).run(value, "task-1");
+    }
+
+    function updateWorkspaceField(fieldName: string, value: string | null): void {
+      tempDb!.database.prepare(`UPDATE task_workspaces SET ${fieldName} = ? WHERE id = ?`).run(value, "ws-task-1");
+    }
+
+    function snapshotWith(overrides: Partial<ReviewerEvidenceSnapshot>): ReviewerEvidenceSnapshot {
+      return {
+        ...createClaimedEvidenceSnapshotFixture(),
+        ...overrides,
+      };
+    }
+
+    it("loads a valid snapshot with exact persisted fields", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+
+      expect(snapshot).toEqual({
+        taskId: "task-1",
+        projectId: "proj-1",
+        reviewId: "review-1",
+        reviewNumber: 1,
+        runNumber: 1,
+        reviewStatus: "RUNNING",
+        reviewerClaimJson: CLAIM_JSON,
+        snapshotWorkspaceId: "ws-task-1",
+        snapshotBaseCommit: "abc123def456",
+        snapshotHeadCommit: "head-commit-123",
+        snapshotFingerprint: "fingerprint-123",
+        taskState: "REVIEWING",
+        contractJson: CONTRACT_JSON,
+        currentRevisionJson: REVISION_JSON,
+        workspaceId: "ws-task-1",
+        workspaceTaskId: "task-1",
+        workspacePath: "/tmp/workspaces/task-1",
+        workspaceBaseCommit: "abc123def456",
+        workspaceStatus: "READY",
+      });
+    });
+
+    it("revalidates unchanged snapshot and returns void", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      expect(assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot)).toBeUndefined();
+    });
+
+    it("preserves exact JSON strings without reserialization", () => {
+      const spacedClaim = '{ "kind" : "REVIEWER_CLAIM", "agent" : "reviewer-a" }';
+      const spacedContract = '{ "classification" : "EXECUTABLE_TASK" }';
+      const spacedRevision = '{ "status" : "REVIEWING" }';
+      tempDb = createTempDatabase();
+      const project = createTestProject(tempDb);
+      const task = createTestTask(tempDb, project.id, {
+        contractJson: spacedContract,
+        currentRevisionJson: spacedRevision,
+      });
+      const workspace = createReadyWorkspace(tempDb, task.id, { id: "ws-task-1" });
+
+      claimReviewerRun(tempDb.database, defaultClaimInput({
+        taskId: task.id,
+        workspaceId: workspace.id,
+        reviewerClaimJson: spacedClaim,
+        snapshotBaseCommit: workspace.baseCommit,
+      }));
+
+      const snapshot = loadReviewerEvidenceSnapshot(tempDb.database, {
+        taskId: task.id,
+        reviewId: "review-1",
+        expectedReviewerClaimJson: spacedClaim,
+      });
+
+      expect(snapshot.reviewerClaimJson).toBe(spacedClaim);
+      expect(snapshot.contractJson).toBe(spacedContract);
+      expect(snapshot.currentRevisionJson).toBe(spacedRevision);
+    });
+
+    it("does not modify rows or timestamps", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      const beforeReview = tempDb!.database.prepare("SELECT * FROM task_reviews WHERE id = ?").get("review-1");
+      const beforeTask = tempDb!.database.prepare("SELECT * FROM tasks WHERE id = ?").get("task-1");
+      const beforeWorkspace = tempDb!.database.prepare("SELECT * FROM task_workspaces WHERE id = ?").get("ws-task-1");
+      const beforeReviewCount = readReviewCount(tempDb!, "task-1");
+
+      assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot);
+
+      expect(tempDb!.database.prepare("SELECT * FROM task_reviews WHERE id = ?").get("review-1")).toEqual(beforeReview);
+      expect(tempDb!.database.prepare("SELECT * FROM tasks WHERE id = ?").get("task-1")).toEqual(beforeTask);
+      expect(tempDb!.database.prepare("SELECT * FROM task_workspaces WHERE id = ?").get("ws-task-1")).toEqual(beforeWorkspace);
+      expect(readReviewCount(tempDb!, "task-1")).toBe(beforeReviewCount);
+    });
+
+    it("rejects empty taskId", () => {
+      tempDb = createTempDatabase();
+      expectSnapshotError(
+        () => loadReviewerEvidenceSnapshot(tempDb!.database, { taskId: "", reviewId: "review-1", expectedReviewerClaimJson: CLAIM_JSON }),
+        "REVIEWER_EVIDENCE_INVALID_INPUT",
+      );
+    });
+
+    it("rejects empty reviewId", () => {
+      tempDb = createTempDatabase();
+      expectSnapshotError(
+        () => loadReviewerEvidenceSnapshot(tempDb!.database, { taskId: "task-1", reviewId: "", expectedReviewerClaimJson: CLAIM_JSON }),
+        "REVIEWER_EVIDENCE_INVALID_INPUT",
+      );
+    });
+
+    it("rejects empty expectedReviewerClaimJson", () => {
+      tempDb = createTempDatabase();
+      expectSnapshotError(
+        () => loadReviewerEvidenceSnapshot(tempDb!.database, { taskId: "task-1", reviewId: "review-1", expectedReviewerClaimJson: "" }),
+        "REVIEWER_EVIDENCE_INVALID_INPUT",
+      );
+    });
+
+    it("rejects invalid snapshot on revalidation", () => {
+      const snapshot = snapshotWith({ reviewId: "" });
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_INVALID_INPUT",
+      );
+    });
+
+    it("rejects missing review", () => {
+      tempDb = createTempDatabase();
+      expectSnapshotError(
+        () => loadReviewerEvidenceSnapshot(tempDb!.database, { taskId: "task-1", reviewId: "missing", expectedReviewerClaimJson: CLAIM_JSON }),
+        "REVIEWER_EVIDENCE_REVIEW_NOT_FOUND",
+      );
+    });
+
+    it("rejects review belonging to another task", () => {
+      createClaimedEvidenceSnapshotFixture();
+      expectSnapshotError(
+        () => loadReviewerEvidenceSnapshot(tempDb!.database, { taskId: "other-task", reviewId: "review-1", expectedReviewerClaimJson: CLAIM_JSON }),
+        "REVIEWER_EVIDENCE_REVIEW_STATE_CHANGED",
+      );
+    });
+
+    it("rejects different claim", () => {
+      createClaimedEvidenceSnapshotFixture();
+      expectSnapshotError(
+        () => loadReviewerEvidenceSnapshot(tempDb!.database, { taskId: "task-1", reviewId: "review-1", expectedReviewerClaimJson: "different" }),
+        "REVIEWER_EVIDENCE_CLAIM_NOT_OWNED",
+      );
+    });
+
+    it("rejects null claim", () => {
+      createClaimedEvidenceSnapshotFixture();
+      disableChecksForCorruption();
+      updateReviewField("reviewerClaimJson", null);
+      enableChecksAfterCorruption();
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_CLAIM_NOT_OWNED");
+    });
+
+    it("rejects COMPLETED review", () => {
+      createClaimedEvidenceSnapshotFixture();
+      tempDb!.database
+        .prepare("UPDATE task_reviews SET status = 'COMPLETED', reviewerClaimJson = NULL, verdict = 'APPROVED', summary = 'ok', findingsJson = '[]', requiredChangesJson = '[]', completedAt = ? WHERE id = ?")
+        .run("2026-07-22T00:00:00.000Z", "review-1");
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_REVIEW_STATE_CHANGED");
+    });
+
+    it("rejects DISCARDED review", () => {
+      createClaimedEvidenceSnapshotFixture();
+      tempDb!.database
+        .prepare("UPDATE task_reviews SET status = 'DISCARDED', reviewerClaimJson = NULL, discardReason = 'test', discardedAt = ? WHERE id = ?")
+        .run("2026-07-22T00:00:00.000Z", "review-1");
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_REVIEW_STATE_CHANGED");
+    });
+
+    it("detects reviewNumber change during revalidation", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      updateReviewField("reviewNumber", 2);
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_REVIEW_STATE_CHANGED",
+      );
+    });
+
+    it("detects runNumber change during revalidation", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      updateReviewField("runNumber", 2);
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_REVIEW_STATE_CHANGED",
+      );
+    });
+
+    it("rejects semantically equivalent but string-different claim", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      updateReviewField("reviewerClaimJson", '{ "kind" : "REVIEWER_CLAIM", "agent" : "reviewer-a" }');
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_CLAIM_NOT_OWNED",
+      );
+    });
+
+    it.each([
+      ["snapshotWorkspaceId"],
+      ["snapshotBaseCommit"],
+      ["snapshotHeadCommit"],
+      ["snapshotFingerprint"],
+    ])("rejects null %s", (fieldName) => {
+      createClaimedEvidenceSnapshotFixture();
+      disableChecksForCorruption();
+      updateReviewField(fieldName, null);
+      enableChecksAfterCorruption();
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_SNAPSHOT_INVALID");
+    });
+
+    it("rejects missing workspace", () => {
+      createClaimedEvidenceSnapshotFixture();
+      tempDb!.database.exec("PRAGMA foreign_keys = OFF;");
+      tempDb!.database.prepare("DELETE FROM task_workspaces WHERE id = ?").run("ws-task-1");
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_WORKSPACE_NOT_FOUND");
+    });
+
+    it("rejects workspace belonging to another task", () => {
+      createClaimedEvidenceSnapshotFixture();
+      createTestTask(tempDb!, "proj-1", { id: "task-2", contractJson: CONTRACT_JSON, currentRevisionJson: REVISION_JSON });
+      updateWorkspaceField("taskId", "task-2");
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_SNAPSHOT_INVALID");
+    });
+
+    it("rejects workspace not READY", () => {
+      createClaimedEvidenceSnapshotFixture();
+      updateWorkspaceField("status", "FAILED");
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_SNAPSHOT_INVALID");
+    });
+
+    it("detects workspace baseCommit change during revalidation", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      updateWorkspaceField("baseCommit", "other-base");
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_SNAPSHOT_CHANGED",
+      );
+    });
+
+    it("detects workspacePath change during revalidation", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      updateWorkspaceField("workspacePath", "/tmp/workspaces/other");
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_SNAPSHOT_CHANGED",
+      );
+    });
+
+    it.each([
+      ["snapshotBaseCommit"],
+      ["snapshotHeadCommit"],
+      ["snapshotFingerprint"],
+    ])("detects %s change during revalidation", (fieldName) => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      if (fieldName === "snapshotBaseCommit") {
+        updateWorkspaceField("baseCommit", "changed-value");
+      }
+      updateReviewField(fieldName, "changed-value");
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_SNAPSHOT_CHANGED",
+      );
+    });
+
+    it("rejects missing task", () => {
+      createClaimedEvidenceSnapshotFixture();
+      tempDb!.database.exec("PRAGMA foreign_keys = OFF;");
+      tempDb!.database.prepare("DELETE FROM tasks WHERE id = ?").run("task-1");
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_TASK_NOT_FOUND");
+    });
+
+    it("rejects task outside REVIEWING", () => {
+      createClaimedEvidenceSnapshotFixture();
+      updateTaskField("state", "EXECUTING");
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_TASK_STATE_CHANGED");
+    });
+
+    it("detects projectId change during revalidation", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      createTestProject(tempDb!, "proj-2");
+      updateTaskField("projectId", "proj-2");
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_TASK_STATE_CHANGED",
+      );
+    });
+
+    it("rejects null contractJson", () => {
+      createClaimedEvidenceSnapshotFixture();
+      updateTaskField("contractJson", null);
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_CONTRACT_CHANGED");
+    });
+
+    it("detects contractJson change during revalidation", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      updateTaskField("contractJson", "changed-contract");
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_CONTRACT_CHANGED",
+      );
+    });
+
+    it("rejects null currentRevisionJson", () => {
+      createClaimedEvidenceSnapshotFixture();
+      updateTaskField("currentRevisionJson", null);
+
+      expectSnapshotError(loadSnapshot, "REVIEWER_EVIDENCE_REVISION_CHANGED");
+    });
+
+    it("detects currentRevisionJson change during revalidation", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      updateTaskField("currentRevisionJson", "changed-revision");
+
+      expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_REVISION_CHANGED",
+      );
+    });
+
+    it("wraps unexpected SQLite errors with cause", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      tempDb!.close();
+
+      const error = expectSnapshotError(
+        () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+        "REVIEWER_EVIDENCE_PERSISTENCE_FAILED",
+      );
+      expect(error.cause).toBeInstanceOf(Error);
+    });
+
+    it("keeps connection usable after a validation error", () => {
+      createClaimedEvidenceSnapshotFixture();
+      expectSnapshotError(
+        () => loadReviewerEvidenceSnapshot(tempDb!.database, { taskId: "task-1", reviewId: "review-1", expectedReviewerClaimJson: "wrong" }),
+        "REVIEWER_EVIDENCE_CLAIM_NOT_OWNED",
+      );
+
+      expect(loadSnapshot().reviewId).toBe("review-1");
+    });
+
+    it("detects changes made by a second connection", () => {
+      const snapshot = createClaimedEvidenceSnapshotFixture();
+      const secondDb = openDatabase(tempDb!.databasePath);
+      initializeSchema(secondDb);
+
+      try {
+        secondDb.prepare("UPDATE task_reviews SET reviewerClaimJson = ? WHERE id = ?").run("stolen", "review-1");
+
+        expectSnapshotError(
+          () => assertReviewerEvidenceSnapshotStillOwned(tempDb!.database, snapshot),
+          "REVIEWER_EVIDENCE_CLAIM_NOT_OWNED",
+        );
+      } finally {
+        secondDb.close();
+      }
     });
   });
 });
