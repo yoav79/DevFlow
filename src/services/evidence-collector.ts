@@ -30,7 +30,7 @@ import {
   ReviewerClaimError,
 } from "./reviewer-claim-service.js";
 import type { ReviewerEvidenceSnapshot } from "./reviewer-claim-service.js";
-import { PersistedTaskContractError } from "../repositories/task-repository.js";
+import { PersistedTaskContractError, getTaskContract } from "../repositories/task-repository.js";
 import { listCompletedReviewsByTaskId } from "../repositories/task-review-repository.js";
 import type { TaskReview } from "../types.js";
 import { reviewerResultSchema } from "../schemas/reviewer-result-schema.js";
@@ -104,6 +104,7 @@ export interface EvidenceCollectorDeps {
   ) => readonly EvidenceFile[];
   readonly createBundle?: (input: unknown) => EvidenceBundle;
   readonly listCompletedReviews?: (database: DatabaseSync, taskId: string) => readonly TaskReview[];
+  readonly getTaskContract?: (database: DatabaseSync, taskId: string) => import("../types.js").TaskContract | null;
   readonly readPreviousBlobBytes?: (
     workspacePath: string,
     baseCommit: string,
@@ -134,7 +135,7 @@ function defaultReadPreviousBlobBytes(
   filePath: string,
   objectId: string,
 ): Buffer {
-  const args = ["show", `${baseCommit}:${filePath}`];
+  const args = ["cat-file", "blob", objectId];
   const result = spawnSync("git", ["-C", workspacePath, ...args], {
     encoding: "buffer",
     shell: false,
@@ -173,7 +174,7 @@ function defaultReadPreviousSymlinkTarget(
   filePath: string,
   objectId: string,
 ): string {
-  const args = ["show", `${baseCommit}:${filePath}`];
+  const args = ["cat-file", "blob", objectId];
   const result = spawnSync("git", ["-C", workspacePath, ...args], {
     encoding: "utf8",
     shell: false,
@@ -212,8 +213,8 @@ function defaultReadPatch(
   filePath: string,
   previousPath?: string,
 ): string {
-  const diffPath = previousPath !== undefined ? `${previousPath} ${filePath}` : filePath;
-  const args = ["diff", baseCommit, "--", ...diffPath.split(" ")];
+  const paths = previousPath !== undefined ? [previousPath, filePath] : [filePath];
+  const args = ["diff", baseCommit, "--", ...paths];
   const result = spawnSync("git", ["-C", workspacePath, ...args], {
     encoding: "utf8",
     shell: false,
@@ -241,6 +242,16 @@ function defaultReadPatch(
         },
       },
     );
+  }
+
+  if (result.stdout.length === 0) {
+    throw new EvidenceCollectorError("Git devolvió un patch vacío.", {
+      code: "GIT_DETECTION_FAILED",
+      details: {
+        path: filePath,
+        previousPath,
+      },
+    });
   }
 
   return result.stdout;
@@ -328,7 +339,7 @@ function verifyFinalSnapshotState(
 // Deterministic revision
 // ---------------------------------------------------------------------------
 
-function buildDeterministicRevisionEvidence(
+function buildRevisionEvidence(
   snapshot: ReviewerEvidenceSnapshot,
 ): DeterministicRevisionResult["status"] extends infer S
   ? { status: S; pathValidation: DeterministicRevisionResult["pathValidation"]; commandsResult: DeterministicRevisionResult["commandsResult"] }
@@ -432,44 +443,47 @@ type ApprovedContractEvidence = {
   risks: string[];
 };
 
-function buildApprovedContractEvidence(snapshot: ReviewerEvidenceSnapshot): ApprovedContractEvidence {
-  let parsed: unknown;
+function buildApprovedContractEvidence(
+  database: DatabaseSync,
+  taskId: string,
+  getTaskContractFn: (database: DatabaseSync, taskId: string) => import("../types.js").TaskContract | null,
+): ApprovedContractEvidence {
+  let contract;
   try {
-    parsed = JSON.parse(snapshot.contractJson);
+    contract = getTaskContractFn(database, taskId);
   } catch (error) {
-    throw new EvidenceCollectorError("contractJson no es JSON válido.", {
-      code: "CONTRACT_INVALID",
-      cause: error,
-    });
+    if (error instanceof PersistedTaskContractError) {
+      throw new EvidenceCollectorError("El contrato de la tarea persistido es inválido.", {
+        code: "CONTRACT_INVALID",
+        cause: error,
+      });
+    }
+
+    if (error instanceof Error) {
+      throw new EvidenceCollectorError("No se pudo cargar el contrato de la tarea.", {
+        code: "CONTRACT_INVALID",
+        cause: error,
+      });
+    }
+
+    throw error;
   }
 
-  if (
-    typeof parsed !== "object" ||
-    parsed === null
-  ) {
-    throw new EvidenceCollectorError("contractJson no es un objeto válido.", {
-      code: "CONTRACT_INVALID",
-    });
-  }
-
-  const contract = parsed as Record<string, unknown>;
-
-  if (contract.status !== "APPROVED") {
+  if (contract === null) {
     throw new EvidenceCollectorError("El contrato de la tarea no está aprobado.", {
       code: "CONTRACT_NOT_APPROVED",
-      details: { status: contract.status },
     });
   }
 
   const evidenceData: ApprovedContractEvidence = {
-    objective: String(contract.objective),
-    context: String(contract.context),
-    acceptanceCriteria: contract.acceptanceCriteria as string[],
-    allowedPaths: contract.allowedPaths as string[],
-    forbiddenPaths: contract.forbiddenPaths as string[],
-    requiredCommands: contract.requiredCommands as string[],
-    assumptions: contract.assumptions as string[],
-    risks: contract.risks as string[],
+    objective: contract.objective,
+    context: contract.context,
+    acceptanceCriteria: contract.acceptanceCriteria,
+    allowedPaths: contract.allowedPaths,
+    forbiddenPaths: contract.forbiddenPaths,
+    requiredCommands: contract.requiredCommands,
+    assumptions: contract.assumptions,
+    risks: contract.risks,
   };
 
   const schemaResult = approvedContractEvidenceSchema.safeParse(evidenceData);
@@ -505,8 +519,26 @@ function buildPreviousCorrections(
   const seenNumbers = new Set<number>();
 
   for (const review of completedAsc) {
+    if (review.status !== "COMPLETED") {
+      throw new EvidenceCollectorError("Review no completado en reviews completados.", {
+        code: "PREVIOUS_REVIEW_INVALID",
+        details: {
+          reviewNumber: review.reviewNumber,
+          status: review.status,
+          reviewId: review.id,
+        },
+      });
+    }
+
     if (review.reviewNumber >= snapshot.reviewNumber) {
-      continue;
+      throw new EvidenceCollectorError("Review con reviewNumber >= current reviewNumber.", {
+        code: "PREVIOUS_REVIEW_INVALID",
+        details: {
+          reviewNumber: review.reviewNumber,
+          currentReviewNumber: snapshot.reviewNumber,
+          reviewId: review.id,
+        },
+      });
     }
 
     if (seenNumbers.has(review.reviewNumber)) {
@@ -520,8 +552,25 @@ function buildPreviousCorrections(
     }
     seenNumbers.add(review.reviewNumber);
 
+    if (review.verdict === "APPROVED") {
+      throw new EvidenceCollectorError("Review aprobado no debería estar en reviews completados.", {
+        code: "PREVIOUS_REVIEW_APPROVED",
+        details: {
+          reviewNumber: review.reviewNumber,
+          reviewId: review.id,
+        },
+      });
+    }
+
     if (review.verdict !== "REVISION_REQUIRED") {
-      continue;
+      throw new EvidenceCollectorError("Review con verdict inválido.", {
+        code: "PREVIOUS_REVIEW_INVALID",
+        details: {
+          reviewNumber: review.reviewNumber,
+          verdict: review.verdict,
+          reviewId: review.id,
+        },
+      });
     }
 
     if (review.findingsJson === null || review.requiredChangesJson === null) {
@@ -662,6 +711,80 @@ function mapError(error: unknown): never {
 }
 
 // ---------------------------------------------------------------------------
+// ChangedFiles structural comparison
+// ---------------------------------------------------------------------------
+
+function compareChangedFile(actual: ChangedFile, expected: ChangedFile): boolean {
+  if (actual.status !== expected.status) return false;
+  if (actual.path !== expected.path) return false;
+
+  switch (actual.status) {
+    case "ADDED": {
+      if (expected.status !== "ADDED") return false;
+      if (actual.currentMode !== expected.currentMode) return false;
+      return true;
+    }
+    case "MODIFIED": {
+      if (expected.status !== "MODIFIED") return false;
+      if (actual.previousMode !== expected.previousMode) return false;
+      if (actual.currentMode !== expected.currentMode) return false;
+      if (actual.previousObjectId !== expected.previousObjectId) return false;
+      return true;
+    }
+    case "DELETED": {
+      if (expected.status !== "DELETED") return false;
+      if (actual.previousMode !== expected.previousMode) return false;
+      if (actual.previousObjectId !== expected.previousObjectId) return false;
+      return true;
+    }
+    case "RENAMED": {
+      if (expected.status !== "RENAMED") return false;
+      if (actual.previousPath !== expected.previousPath) return false;
+      if (actual.previousMode !== expected.previousMode) return false;
+      if (actual.currentMode !== expected.currentMode) return false;
+      if (actual.previousObjectId !== expected.previousObjectId) return false;
+      if (actual.similarityScore !== expected.similarityScore) return false;
+      return true;
+    }
+    case "UNTRACKED": {
+      if (expected.status !== "UNTRACKED") return false;
+      if (actual.currentMode !== expected.currentMode) return false;
+      return true;
+    }
+  }
+}
+
+function assertChangedFilesMatch(
+  actualFiles: readonly ChangedFile[],
+  expectedFiles: readonly ChangedFile[],
+): void {
+  if (actualFiles.length !== expectedFiles.length) {
+    throw new EvidenceCollectorError("El número de changedFiles no coincide con la revisión determinista.", {
+      code: "DETERMINISTIC_REVISION_INVALID",
+      details: {
+        expected: expectedFiles.length,
+        actual: actualFiles.length,
+      },
+    });
+  }
+
+  for (let i = 0; i < actualFiles.length; i++) {
+    const actual = actualFiles[i]!;
+    const expected = expectedFiles[i]!;
+    if (!compareChangedFile(actual, expected)) {
+      throw new EvidenceCollectorError("El changedFile no coincide con la revisión determinista.", {
+        code: "DETERMINISTIC_REVISION_INVALID",
+        details: {
+          index: i,
+          expected,
+          actual,
+        },
+      });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main function
 // ---------------------------------------------------------------------------
 
@@ -686,6 +809,7 @@ export function collectEvidenceBundle(
     const collectFiles = deps.collectFiles ?? collectEvidenceFiles;
     const createBundle = deps.createBundle ?? createEvidenceBundle;
     const listCompletedReviews = deps.listCompletedReviews ?? listCompletedReviewsByTaskId;
+    const getTaskContractFn = deps.getTaskContract ?? getTaskContract;
 
     const readPreviousBlobBytesFn = deps.readPreviousBlobBytes ?? defaultReadPreviousBlobBytes;
     const readPreviousSymlinkTargetFn = deps.readPreviousSymlinkTarget ?? defaultReadPreviousSymlinkTarget;
@@ -696,6 +820,13 @@ export function collectEvidenceBundle(
       reviewId,
       expectedReviewerClaimJson,
     });
+
+    if (snapshot.taskId !== taskId) {
+      throw new EvidenceCollectorError("El snapshot no pertenece a la tarea solicitada.", {
+        code: "CONTRACT_INVALID",
+        details: { taskId: snapshot.taskId },
+      });
+    }
 
     const fingerprint = computeFingerprint({
       workspacePath: snapshot.workspacePath,
@@ -729,8 +860,13 @@ export function collectEvidenceBundle(
 
     verifyFinalSnapshotState(snapshot, finalFingerprint);
 
-    const deterministicRevision = buildDeterministicRevisionEvidence(snapshot);
-    const approvedContract = buildApprovedContractEvidence(snapshot);
+    const deterministicRevision = buildRevisionEvidence(snapshot);
+
+    const revisionParsed = JSON.parse(snapshot.currentRevisionJson) as Record<string, unknown>;
+    const revisionChangedFiles = revisionParsed.changedFiles as readonly ChangedFile[];
+    assertChangedFilesMatch(changedFiles, revisionChangedFiles);
+
+    const approvedContract = buildApprovedContractEvidence(db, snapshot.taskId, getTaskContractFn);
     const previousCorrections = buildPreviousCorrections(
       snapshot,
       listCompletedReviews,

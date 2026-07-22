@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 
 import type {
@@ -19,6 +23,7 @@ import { ReviewerClaimError } from "../../src/services/reviewer-claim-service.js
 import type { ReviewerEvidenceSnapshot } from "../../src/services/reviewer-claim-service.js";
 import { WorkspaceFingerprintError } from "../../src/services/workspace-fingerprint.js";
 import type { WorkspaceFingerprint } from "../../src/services/workspace-fingerprint.js";
+import { PersistedTaskContractError } from "../../src/repositories/task-repository.js";
 import type { TaskReview } from "../../src/types.js";
 import type { ReviewerResult } from "../../src/schemas/reviewer-result-schema.js";
 
@@ -207,6 +212,7 @@ function buildDeps(overrides: Partial<EvidenceCollectorDeps> = {}): EvidenceColl
     collectFiles: vi.fn(),
     createBundle: vi.fn(),
     listCompletedReviews: vi.fn(),
+    getTaskContract: vi.fn(),
     readPreviousBlobBytes: vi.fn(),
     readPreviousSymlinkTarget: vi.fn(),
     readPatch: vi.fn(),
@@ -221,6 +227,19 @@ function buildMockDeps(overrides: Partial<EvidenceCollectorDeps> = {}): Evidence
   const evidenceFiles: readonly EvidenceFile[] = [];
   const bundle = { body: {}, bundleDigest: H64 };
 
+  const defaultGetTaskContract = vi.fn().mockReturnValue({
+    classification: "EXECUTABLE_TASK",
+    objective: "Implement feature",
+    context: "Need to implement",
+    acceptanceCriteria: ["Works correctly"],
+    allowedPaths: ["src/**"],
+    forbiddenPaths: ["node_modules/**"],
+    requiredCommands: [],
+    assumptions: [],
+    risks: [],
+    openQuestions: [],
+  });
+
   return {
     loadSnapshot: vi.fn().mockReturnValue(snapshot),
     assertSnapshotStillOwned: vi.fn(),
@@ -229,6 +248,7 @@ function buildMockDeps(overrides: Partial<EvidenceCollectorDeps> = {}): Evidence
     collectFiles: vi.fn().mockReturnValue(evidenceFiles),
     createBundle: vi.fn().mockReturnValue(bundle),
     listCompletedReviews: vi.fn().mockReturnValue([]),
+    getTaskContract: defaultGetTaskContract,
     readPreviousBlobBytes: vi.fn(),
     readPreviousSymlinkTarget: vi.fn(),
     readPatch: vi.fn(),
@@ -251,6 +271,55 @@ function expectCollectorError(
     expect(error).toBeInstanceOf(EvidenceCollectorError);
     expect((error as EvidenceCollectorError).code).toBe(code);
   }
+}
+
+function runGit(workspacePath: string, args: readonly string[]): string {
+  const result = spawnSync("git", ["-C", workspacePath, ...args], {
+    encoding: "utf8",
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  if (result.error !== undefined) {
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+
+  return result.stdout.trim();
+}
+
+function withTempGitRepo<T>(fn: (workspacePath: string) => T): T {
+  const workspacePath = mkdtempSync(join(tmpdir(), "devflow-evidence-collector-"));
+  try {
+    runGit(workspacePath, ["init"]);
+    runGit(workspacePath, ["config", "user.name", "DevFlow Test"]);
+    runGit(workspacePath, ["config", "user.email", "devflow@example.test"]);
+    return fn(workspacePath);
+  } finally {
+    rmSync(workspacePath, { recursive: true, force: true });
+  }
+}
+
+function commitAll(workspacePath: string, message: string): string {
+  runGit(workspacePath, ["add", "."]);
+  runGit(workspacePath, ["commit", "-m", message]);
+  return runGit(workspacePath, ["rev-parse", "HEAD"]);
+}
+
+function revisionJson(baseCommit: string, changedFiles: readonly ChangedFile[]): string {
+  return JSON.stringify({
+    status: "REVIEWING",
+    taskId: "task-1",
+    projectId: "project-1",
+    workspaceId: "workspace-1",
+    baseCommit,
+    changedFiles,
+    pathValidation: { passed: true, violations: [] },
+    commandsResult: null,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +352,21 @@ describe("collectEvidenceBundle", () => {
       const changedFiles = [addedFile("a.ts"), modifiedFile("b.ts")];
       const evidenceFiles: EvidenceFile[] = [textAddedFile("a.ts")];
 
+      const snapshot = buildSnapshot({
+        currentRevisionJson: JSON.stringify({
+          status: "REVIEWING",
+          taskId: "task-1",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          baseCommit: H40,
+          changedFiles,
+          pathValidation: { passed: true, violations: [] },
+          commandsResult: null,
+        }),
+      });
+
       const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
         detectChanges: vi.fn().mockReturnValue({ changedFiles }),
         collectFiles: vi.fn().mockReturnValue(evidenceFiles),
       });
@@ -296,10 +379,9 @@ describe("collectEvidenceBundle", () => {
       }, deps);
 
       expect(result).toBeDefined();
-      expect(deps.collectFiles).toHaveBeenCalledWith(
-        expect.objectContaining({ changedFiles }),
-        expect.anything(),
-      );
+      const collectFilesCall = deps.collectFiles.mock.calls[0]!;
+      expect(collectFilesCall[0]).toEqual(expect.objectContaining({ changedFiles }));
+      expect(typeof collectFilesCall[1]?.readPatch).toBe("function");
     });
 
     it("returns bundle with empty previousCorrections when no completed reviews", () => {
@@ -481,7 +563,20 @@ describe("collectEvidenceBundle", () => {
 
     it("passes correct arguments to collectFiles", () => {
       const changedFiles = [addedFile()];
+      const snapshot = buildSnapshot({
+        currentRevisionJson: JSON.stringify({
+          status: "REVIEWING",
+          taskId: "task-1",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          baseCommit: H40,
+          changedFiles,
+          pathValidation: { passed: true, violations: [] },
+          commandsResult: null,
+        }),
+      });
       const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
         detectChanges: vi.fn().mockReturnValue({ changedFiles }),
       });
       const db = {} as never;
@@ -492,18 +587,15 @@ describe("collectEvidenceBundle", () => {
         expectedReviewerClaimJson: "claim-json-1",
       }, deps);
 
-      expect(deps.collectFiles).toHaveBeenCalledWith(
-        {
-          workspacePath: "/repo/work",
-          baseCommit: H40,
-          changedFiles,
-        },
-        expect.objectContaining({
-          readPreviousBlobBytes: expect.any(Function),
-          readPreviousSymlinkTarget: expect.any(Function),
-          readPatch: expect.any(Function),
-        }),
-      );
+      const collectFilesCall = deps.collectFiles.mock.calls[0]!;
+      expect(collectFilesCall[0]).toEqual({
+        workspacePath: "/repo/work",
+        baseCommit: H40,
+        changedFiles,
+      });
+      expect(typeof collectFilesCall[1]?.readPreviousBlobBytes).toBe("function");
+      expect(typeof collectFilesCall[1]?.readPreviousSymlinkTarget).toBe("function");
+      expect(typeof collectFilesCall[1]?.readPatch).toBe("function");
     });
   });
 
@@ -604,7 +696,7 @@ describe("collectEvidenceBundle", () => {
   });
 
   describe("previous correction edge cases", () => {
-    it("skips reviews with reviewNumber >= current reviewNumber", () => {
+    it("throws PREVIOUS_REVIEW_INVALID when reviewNumber >= current reviewNumber", () => {
       const review1 = completedReview({ reviewNumber: 2 });
       const review2 = completedReview({ reviewNumber: 3 });
 
@@ -615,14 +707,15 @@ describe("collectEvidenceBundle", () => {
       });
 
       const db = {} as never;
-      collectEvidenceBundle(db, {
-        taskId: "task-1",
-        reviewId: "review-2",
-        expectedReviewerClaimJson: "claim-json-1",
-      }, deps);
 
-      const bundleBodyArg = deps.createBundle.mock.calls[0][0] as EvidenceBundleBody;
-      expect(bundleBodyArg.previousCorrections).toHaveLength(0);
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-2",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
     });
 
     it("includes only reviews with reviewNumber < current reviewNumber", () => {
@@ -668,7 +761,7 @@ describe("collectEvidenceBundle", () => {
       );
     });
 
-    it("skips APPROVED reviews and only includes REVISION_REQUIRED", () => {
+    it("throws PREVIOUS_REVIEW_APPROVED when APPROVED review exists", () => {
       const rev1 = completedReview({
         reviewNumber: 1,
         verdict: "REVISION_REQUIRED",
@@ -690,22 +783,24 @@ describe("collectEvidenceBundle", () => {
       });
 
       const db = {} as never;
-      collectEvidenceBundle(db, {
-        taskId: "task-1",
-        reviewId: "review-4",
-        expectedReviewerClaimJson: "claim-json-1",
-      }, deps);
 
-      const bundleBodyArg = deps.createBundle.mock.calls[0][0] as EvidenceBundleBody;
-      expect(bundleBodyArg.previousCorrections).toHaveLength(2);
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-4",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_APPROVED",
+      );
     });
   });
 
   describe("contract and revision invalidity", () => {
-    it("throws CONTRACT_INVALID when contractJson is not valid JSON", () => {
-      const snapshot = buildSnapshot({ contractJson: "not-json" });
+    it("throws CONTRACT_INVALID when getTaskContract throws PersistedTaskContractError", () => {
       const deps = buildMockDeps({
-        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        getTaskContract: vi.fn().mockImplementation(() => {
+          throw new PersistedTaskContractError("task-1", "JSON inválido.");
+        }),
       });
 
       const db = {} as never;
@@ -720,22 +815,9 @@ describe("collectEvidenceBundle", () => {
       );
     });
 
-    it("throws CONTRACT_NOT_APPROVED when contract status is not APPROVED", () => {
-      const snapshot = buildSnapshot({
-        contractJson: JSON.stringify({
-          objective: "Test",
-          context: "Test",
-          acceptanceCriteria: [],
-          allowedPaths: [],
-          forbiddenPaths: [],
-          requiredCommands: [],
-          assumptions: [],
-          risks: [],
-          status: "PENDING",
-        }),
-      });
+    it("throws CONTRACT_NOT_APPROVED when getTaskContract returns null", () => {
       const deps = buildMockDeps({
-        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        getTaskContract: vi.fn().mockReturnValue(null),
       });
 
       const db = {} as never;
@@ -747,6 +829,87 @@ describe("collectEvidenceBundle", () => {
           expectedReviewerClaimJson: "claim-json-1",
         }, deps),
         "CONTRACT_NOT_APPROVED",
+      );
+    });
+
+    it("throws CONTRACT_INVALID when getTaskContract throws generic Error", () => {
+      const original = new Error("No existe la tarea: task-1");
+      const deps = buildMockDeps({
+        getTaskContract: vi.fn().mockImplementation(() => {
+          throw original;
+        }),
+      });
+
+      const db = {} as never;
+
+      try {
+        collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps);
+        expect.fail("Expected EvidenceCollectorError");
+      } catch (error) {
+        expect(error).toBeInstanceOf(EvidenceCollectorError);
+        expect((error as EvidenceCollectorError).code).toBe("CONTRACT_INVALID");
+        expect((error as EvidenceCollectorError).cause).toBe(original);
+      }
+    });
+
+    it("calls getTaskContract exactly once with database and taskId", () => {
+      const getTaskContractMock = vi.fn().mockReturnValue({
+        classification: "EXECUTABLE_TASK",
+        objective: "Test",
+        context: "Test",
+        acceptanceCriteria: ["AC1"],
+        allowedPaths: [],
+        forbiddenPaths: [],
+        requiredCommands: [],
+        assumptions: [],
+        risks: [],
+        openQuestions: [],
+      });
+      const deps = buildMockDeps({
+        getTaskContract: getTaskContractMock,
+      });
+
+      const db = {} as never;
+      collectEvidenceBundle(db, {
+        taskId: "task-1",
+        reviewId: "review-1",
+        expectedReviewerClaimJson: "claim-json-1",
+      }, deps);
+
+      expect(getTaskContractMock).toHaveBeenCalledOnce();
+      expect(getTaskContractMock).toHaveBeenCalledWith(db, "task-1");
+    });
+
+    it("throws CONTRACT_INVALID when snapshot taskId differs from input taskId", () => {
+      const snapshot = buildSnapshot({
+        taskId: "other-task",
+        currentRevisionJson: JSON.stringify({
+          status: "REVIEWING",
+          taskId: "other-task",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          baseCommit: H40,
+          changedFiles: [],
+          pathValidation: { passed: true, violations: [] },
+          commandsResult: null,
+        }),
+      });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "CONTRACT_INVALID",
       );
     });
 
@@ -1259,8 +1422,9 @@ describe("collectEvidenceBundle", () => {
 
   describe("approved contract evidence mapping", () => {
     it("maps all contract fields correctly", () => {
-      const snapshot = buildSnapshot({
-        contractJson: JSON.stringify({
+      const deps = buildMockDeps({
+        getTaskContract: vi.fn().mockReturnValue({
+          classification: "EXECUTABLE_TASK",
           objective: "Build feature X",
           context: "Context details",
           acceptanceCriteria: ["AC1", "AC2"],
@@ -1269,12 +1433,8 @@ describe("collectEvidenceBundle", () => {
           requiredCommands: ["npm test"],
           assumptions: ["Assumption 1"],
           risks: ["Risk 1"],
-          status: "APPROVED",
+          openQuestions: [],
         }),
-      });
-
-      const deps = buildMockDeps({
-        loadSnapshot: vi.fn().mockReturnValue(snapshot),
       });
 
       const db = {} as never;
@@ -1412,6 +1572,643 @@ describe("collectEvidenceBundle", () => {
         }),
         "INVALID_INPUT",
       );
+    });
+  });
+
+  describe("changedFiles structural comparison", () => {
+    function snapshotWithChangedFiles(changedFiles: readonly ChangedFile[]) {
+      return buildSnapshot({
+        currentRevisionJson: JSON.stringify({
+          status: "REVIEWING",
+          taskId: "task-1",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          baseCommit: H40,
+          changedFiles,
+          pathValidation: { passed: true, violations: [] },
+          commandsResult: null,
+        }),
+      });
+    }
+
+    it("passes when changedFiles match exactly", () => {
+      const files = [addedFile("a.ts"), modifiedFile("b.ts")];
+      const snapshot = snapshotWithChangedFiles(files);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: files }),
+      });
+
+      const db = {} as never;
+      const result = collectEvidenceBundle(db, {
+        taskId: "task-1",
+        reviewId: "review-1",
+        expectedReviewerClaimJson: "claim-json-1",
+      }, deps);
+
+      expect(result).toBeDefined();
+    });
+
+    it("throws DETERMINISTIC_REVISION_INVALID when count differs (extra file)", () => {
+      const snapshotFiles = [addedFile("a.ts")];
+      const detectFiles = [addedFile("a.ts"), modifiedFile("b.ts")];
+      const snapshot = snapshotWithChangedFiles(snapshotFiles);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: detectFiles }),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "DETERMINISTIC_REVISION_INVALID",
+      );
+    });
+
+    it("throws DETERMINISTIC_REVISION_INVALID when count differs (missing file)", () => {
+      const snapshotFiles = [addedFile("a.ts"), modifiedFile("b.ts")];
+      const detectFiles = [addedFile("a.ts")];
+      const snapshot = snapshotWithChangedFiles(snapshotFiles);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: detectFiles }),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "DETERMINISTIC_REVISION_INVALID",
+      );
+    });
+
+    it("throws when status differs", () => {
+      const snapshotFiles: ChangedFile[] = [{ status: "ADDED", path: "a.ts", currentMode: "100644" }];
+      const detectFiles: ChangedFile[] = [{ status: "MODIFIED", path: "a.ts", previousMode: "100644", currentMode: "100644", previousObjectId: H40_C }];
+      const snapshot = snapshotWithChangedFiles(snapshotFiles);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: detectFiles }),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "DETERMINISTIC_REVISION_INVALID",
+      );
+    });
+
+    it("throws when path differs", () => {
+      const snapshotFiles: ChangedFile[] = [{ status: "ADDED", path: "a.ts", currentMode: "100644" }];
+      const detectFiles: ChangedFile[] = [{ status: "ADDED", path: "b.ts", currentMode: "100644" }];
+      const snapshot = snapshotWithChangedFiles(snapshotFiles);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: detectFiles }),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "DETERMINISTIC_REVISION_INVALID",
+      );
+    });
+
+    it("throws when previousPath differs for RENAMED", () => {
+      const snapshotFiles: ChangedFile[] = [{
+        status: "RENAMED", path: "new.ts", previousPath: "old.ts",
+        previousMode: "100644", currentMode: "100644",
+        previousObjectId: H40_C, similarityScore: 100,
+      }];
+      const detectFiles: ChangedFile[] = [{
+        status: "RENAMED", path: "new.ts", previousPath: "different.ts",
+        previousMode: "100644", currentMode: "100644",
+        previousObjectId: H40_C, similarityScore: 100,
+      }];
+      const snapshot = snapshotWithChangedFiles(snapshotFiles);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: detectFiles }),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "DETERMINISTIC_REVISION_INVALID",
+      );
+    });
+
+    it("throws when mode differs for MODIFIED", () => {
+      const snapshotFiles: ChangedFile[] = [{
+        status: "MODIFIED", path: "a.ts",
+        previousMode: "100644", currentMode: "100644", previousObjectId: H40_C,
+      }];
+      const detectFiles: ChangedFile[] = [{
+        status: "MODIFIED", path: "a.ts",
+        previousMode: "100644", currentMode: "100755", previousObjectId: H40_C,
+      }];
+      const snapshot = snapshotWithChangedFiles(snapshotFiles);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: detectFiles }),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "DETERMINISTIC_REVISION_INVALID",
+      );
+    });
+
+    it("throws when previousObjectId differs for MODIFIED", () => {
+      const snapshotFiles: ChangedFile[] = [{
+        status: "MODIFIED", path: "a.ts",
+        previousMode: "100644", currentMode: "100644", previousObjectId: H40_C,
+      }];
+      const detectFiles: ChangedFile[] = [{
+        status: "MODIFIED", path: "a.ts",
+        previousMode: "100644", currentMode: "100644", previousObjectId: "f".repeat(40),
+      }];
+      const snapshot = snapshotWithChangedFiles(snapshotFiles);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: detectFiles }),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "DETERMINISTIC_REVISION_INVALID",
+      );
+    });
+
+    it("throws when similarityScore differs for RENAMED", () => {
+      const snapshotFiles: ChangedFile[] = [{
+        status: "RENAMED", path: "new.ts", previousPath: "old.ts",
+        previousMode: "100644", currentMode: "100644",
+        previousObjectId: H40_C, similarityScore: 100,
+      }];
+      const detectFiles: ChangedFile[] = [{
+        status: "RENAMED", path: "new.ts", previousPath: "old.ts",
+        previousMode: "100644", currentMode: "100644",
+        previousObjectId: H40_C, similarityScore: 80,
+      }];
+      const snapshot = snapshotWithChangedFiles(snapshotFiles);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: detectFiles }),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "DETERMINISTIC_REVISION_INVALID",
+      );
+    });
+
+    it("passes when RENAMED fields match exactly", () => {
+      const files: ChangedFile[] = [{
+        status: "RENAMED", path: "new.ts", previousPath: "old.ts",
+        previousMode: "100644", currentMode: "100644",
+        previousObjectId: H40_C, similarityScore: 100,
+      }];
+      const snapshot = snapshotWithChangedFiles(files);
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        detectChanges: vi.fn().mockReturnValue({ changedFiles: files }),
+      });
+
+      const db = {} as never;
+      const result = collectEvidenceBundle(db, {
+        taskId: "task-1",
+        reviewId: "review-1",
+        expectedReviewerClaimJson: "claim-json-1",
+      }, deps);
+
+      expect(result).toBeDefined();
+    });
+  });
+
+  describe("previous corrections detailed", () => {
+    it("throws when reviewNumber equals current reviewNumber", () => {
+      const review = completedReview({ reviewNumber: 1 });
+      const snapshot = buildSnapshot({ reviewNumber: 1 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review]),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
+    });
+
+    it("throws when reviewNumber greater than current", () => {
+      const review = completedReview({ reviewNumber: 5 });
+      const snapshot = buildSnapshot({ reviewNumber: 3 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review]),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-3",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
+    });
+
+    it("includes valid REVISION_REQUIRED corrections in ascending order", () => {
+      const review1 = completedReview({ reviewNumber: 1 });
+      const review2 = completedReview({ reviewNumber: 2 });
+      const snapshot = buildSnapshot({ reviewNumber: 3 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review2, review1]),
+      });
+
+      const db = {} as never;
+      collectEvidenceBundle(db, {
+        taskId: "task-1",
+        reviewId: "review-3",
+        expectedReviewerClaimJson: "claim-json-1",
+      }, deps);
+
+      const bundleBodyArg = deps.createBundle.mock.calls[0][0] as EvidenceBundleBody;
+      expect(bundleBodyArg.previousCorrections).toHaveLength(2);
+      expect(bundleBodyArg.previousCorrections[0]!.reviewNumber).toBe(1);
+      expect(bundleBodyArg.previousCorrections[1]!.reviewNumber).toBe(2);
+    });
+
+    it("throws PREVIOUS_REVIEW_INVALID when findingsJson is corrupt", () => {
+      const review = completedReview({
+        reviewNumber: 1,
+        findingsJson: "not-json",
+      });
+      const snapshot = buildSnapshot({ reviewNumber: 2 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review]),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-2",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
+    });
+
+    it("throws PREVIOUS_REVIEW_INVALID when requiredChangesJson is corrupt", () => {
+      const review = completedReview({
+        reviewNumber: 1,
+        requiredChangesJson: "not-json",
+      });
+      const snapshot = buildSnapshot({ reviewNumber: 2 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review]),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-2",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
+    });
+
+    it("throws PREVIOUS_REVIEW_INVALID when findings are empty", () => {
+      const review = completedReview({
+        reviewNumber: 1,
+        findingsJson: "[]",
+      });
+      const snapshot = buildSnapshot({ reviewNumber: 2 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review]),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-2",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
+    });
+
+    it("throws PREVIOUS_REVIEW_INVALID when requiredChanges are empty", () => {
+      const review = completedReview({
+        reviewNumber: 1,
+        requiredChangesJson: "[]",
+      });
+      const snapshot = buildSnapshot({ reviewNumber: 2 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review]),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-2",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
+    });
+
+    it("throws PREVIOUS_REVIEW_INVALID when summary is invalid", () => {
+      const review = completedReview({
+        reviewNumber: 1,
+        summary: "   ",
+      });
+      const snapshot = buildSnapshot({ reviewNumber: 2 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review]),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-2",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
+    });
+
+    it("throws PREVIOUS_REVIEW_INVALID when a listed review is not COMPLETED", () => {
+      const review = completedReview({
+        reviewNumber: 1,
+        status: "RUNNING",
+      });
+      const snapshot = buildSnapshot({ reviewNumber: 2 });
+      const deps = buildMockDeps({
+        loadSnapshot: vi.fn().mockReturnValue(snapshot),
+        listCompletedReviews: vi.fn().mockReturnValue([review]),
+      });
+
+      const db = {} as never;
+      expectCollectorError(
+        () => collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-2",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps),
+        "PREVIOUS_REVIEW_INVALID",
+      );
+    });
+  });
+
+  describe("default Git readers", () => {
+    it("reads previous blob bytes by objectId, not path", () => {
+      withTempGitRepo((workspacePath) => {
+        const binary = Buffer.from([0, 1, 2, 255]);
+        const blobPath = join(workspacePath, "blob.bin");
+        writeFileSync(blobPath, binary);
+        const objectId = runGit(workspacePath, ["hash-object", "-w", "blob.bin"]);
+
+        const collectFiles: NonNullable<EvidenceCollectorDeps["collectFiles"]> = (_input, fileDeps) => {
+          const reader = fileDeps!.readPreviousBlobBytes!;
+          const result = reader(workspacePath, H40, "path/does/not/matter.bin", objectId);
+          expect(result).toEqual(binary);
+          return [];
+        };
+
+        const deps = buildMockDeps({
+          collectFiles: vi.fn(collectFiles),
+          readPreviousBlobBytes: undefined,
+        });
+        const db = {} as never;
+        collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps);
+      });
+    });
+
+    it("decodes previous symlink target by objectId as UTF-8", () => {
+      withTempGitRepo((workspacePath) => {
+        writeFileSync(join(workspacePath, "target.txt"), "../real-target\n", "utf8");
+        const objectId = runGit(workspacePath, ["hash-object", "-w", "target.txt"]);
+
+        const collectFiles: NonNullable<EvidenceCollectorDeps["collectFiles"]> = (_input, fileDeps) => {
+          const reader = fileDeps!.readPreviousSymlinkTarget!;
+          const result = reader(workspacePath, H40, "wrong-link", objectId);
+          expect(result).toBe("../real-target\n");
+          return [];
+        };
+
+        const deps = buildMockDeps({
+          collectFiles: vi.fn(collectFiles),
+          readPreviousSymlinkTarget: undefined,
+        });
+        const db = {} as never;
+        collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps);
+      });
+    });
+
+    it("fails closed and preserves exitCode when blob objectId is invalid", () => {
+      withTempGitRepo((workspacePath) => {
+        const collectFiles: NonNullable<EvidenceCollectorDeps["collectFiles"]> = (_input, fileDeps) => {
+          const reader = fileDeps!.readPreviousBlobBytes!;
+          reader(workspacePath, H40, "irrelevant.bin", "f".repeat(40));
+          return [];
+        };
+
+        const deps = buildMockDeps({
+          collectFiles: vi.fn(collectFiles),
+          readPreviousBlobBytes: undefined,
+        });
+        const db = {} as never;
+
+        try {
+          collectEvidenceBundle(db, {
+            taskId: "task-1",
+            reviewId: "review-1",
+            expectedReviewerClaimJson: "claim-json-1",
+          }, deps);
+          expect.fail("Expected EvidenceCollectorError");
+        } catch (error) {
+          expect(error).toBeInstanceOf(EvidenceCollectorError);
+          expect((error as EvidenceCollectorError).code).toBe("GIT_DETECTION_FAILED");
+          expect(typeof (error as EvidenceCollectorError).details?.["exitCode"]).toBe("number");
+        }
+      });
+    });
+  });
+
+  describe("default readPatch", () => {
+    it("reads non-empty patch for simple MODIFIED file", () => {
+      withTempGitRepo((workspacePath) => {
+        writeFileSync(join(workspacePath, "file.txt"), "before\n", "utf8");
+        const baseCommit = commitAll(workspacePath, "base");
+        writeFileSync(join(workspacePath, "file.txt"), "after\n", "utf8");
+        const changedFiles = [modifiedFile("file.txt")];
+        const snapshot = buildSnapshot({
+          snapshotBaseCommit: baseCommit,
+          currentRevisionJson: revisionJson(baseCommit, changedFiles),
+          workspacePath,
+        });
+
+        const collectFiles: NonNullable<EvidenceCollectorDeps["collectFiles"]> = (_input, fileDeps) => {
+          const patch = fileDeps!.readPatch!(workspacePath, baseCommit, "file.txt");
+          expect(patch).toContain("diff --git");
+          expect(patch).toContain("file.txt");
+          return [];
+        };
+
+        const deps = buildMockDeps({
+          loadSnapshot: vi.fn().mockReturnValue(snapshot),
+          detectChanges: vi.fn().mockReturnValue({ changedFiles }),
+          collectFiles: vi.fn(collectFiles),
+          readPatch: undefined,
+        });
+        const db = {} as never;
+        collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps);
+      });
+    });
+
+    it("reads non-empty patch for RENAMED/MODIFIED with previousPath and current path", () => {
+      withTempGitRepo((workspacePath) => {
+        writeFileSync(join(workspacePath, "old.txt"), "before\n", "utf8");
+        const baseCommit = commitAll(workspacePath, "base");
+        runGit(workspacePath, ["mv", "old.txt", "new.txt"]);
+        writeFileSync(join(workspacePath, "new.txt"), "after\n", "utf8");
+        const changedFiles: ChangedFile[] = [{
+          status: "RENAMED",
+          path: "new.txt",
+          previousPath: "old.txt",
+          previousMode: "100644",
+          currentMode: "100644",
+          previousObjectId: H40_C,
+          similarityScore: 50,
+        }];
+        const snapshot = buildSnapshot({
+          snapshotBaseCommit: baseCommit,
+          currentRevisionJson: revisionJson(baseCommit, changedFiles),
+          workspacePath,
+        });
+
+        const collectFiles: NonNullable<EvidenceCollectorDeps["collectFiles"]> = (_input, fileDeps) => {
+          const patch = fileDeps!.readPatch!(workspacePath, baseCommit, "new.txt", "old.txt");
+          expect(patch).toContain("diff --git");
+          expect(patch).toContain("old.txt");
+          expect(patch).toContain("new.txt");
+          return [];
+        };
+
+        const deps = buildMockDeps({
+          loadSnapshot: vi.fn().mockReturnValue(snapshot),
+          detectChanges: vi.fn().mockReturnValue({ changedFiles }),
+          collectFiles: vi.fn(collectFiles),
+          readPatch: undefined,
+        });
+        const db = {} as never;
+        collectEvidenceBundle(db, {
+          taskId: "task-1",
+          reviewId: "review-1",
+          expectedReviewerClaimJson: "claim-json-1",
+        }, deps);
+      });
+    });
+
+    it("fails closed when patch is empty", () => {
+      withTempGitRepo((workspacePath) => {
+        writeFileSync(join(workspacePath, "file.txt"), "same\n", "utf8");
+        const baseCommit = commitAll(workspacePath, "base");
+        const changedFiles = [modifiedFile("file.txt")];
+        const snapshot = buildSnapshot({
+          snapshotBaseCommit: baseCommit,
+          currentRevisionJson: revisionJson(baseCommit, changedFiles),
+          workspacePath,
+        });
+
+        const collectFiles: NonNullable<EvidenceCollectorDeps["collectFiles"]> = (_input, fileDeps) => {
+          fileDeps!.readPatch!(workspacePath, baseCommit, "file.txt");
+          return [];
+        };
+
+        const deps = buildMockDeps({
+          loadSnapshot: vi.fn().mockReturnValue(snapshot),
+          detectChanges: vi.fn().mockReturnValue({ changedFiles }),
+          collectFiles: vi.fn(collectFiles),
+          readPatch: undefined,
+        });
+        const db = {} as never;
+
+        expectCollectorError(
+          () => collectEvidenceBundle(db, {
+            taskId: "task-1",
+            reviewId: "review-1",
+            expectedReviewerClaimJson: "claim-json-1",
+          }, deps),
+          "GIT_DETECTION_FAILED",
+        );
+      });
     });
   });
 });
