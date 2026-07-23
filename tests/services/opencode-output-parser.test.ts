@@ -3,6 +3,7 @@
 import { describe, it, expect } from "vitest";
 import {
   parseOpenCodeOutput,
+  type OpenCodeOutputParseInput,
   OpenCodeOutputParseError,
 } from "../../src/services/opencode-output-parser.js";
 import type { OpenCodeProcessResult } from "../../src/services/opencode-process-runner.js";
@@ -12,6 +13,19 @@ import type { OpenCodeProcessResult } from "../../src/services/opencode-process-
 // ---------------------------------------------------------------------------
 
 function makeResult(
+  overrides: Partial<OpenCodeOutputParseInput> & { stdout: string },
+): OpenCodeOutputParseInput {
+  return {
+    stderr: "",
+    timedOut: false,
+    aborted: false,
+    stdoutTruncated: false,
+    ...overrides,
+  };
+}
+
+// Full OpenCodeProcessResult fixture for backward compatibility tests
+function makeFullResult(
   overrides: Partial<OpenCodeProcessResult> & { stdout: string },
 ): OpenCodeProcessResult {
   return {
@@ -58,6 +72,96 @@ const STEP_FINISH = JSON.stringify({
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe("input contract", () => {
+  it("accepts minimal OpenCodeOutputParseInput", () => {
+    const stdout = [STEP_START, TEXT_READY, STEP_FINISH].join("\n");
+    const result: OpenCodeOutputParseInput = {
+      stdout,
+      stderr: "",
+      timedOut: false,
+      aborted: false,
+      stdoutTruncated: false,
+    };
+    const output = parseOpenCodeOutput(result);
+    expect(output.assistantText).toBe("READY");
+  });
+
+  it("accepts full OpenCodeProcessResult (structural subtype)", () => {
+    const stdout = [STEP_START, TEXT_READY, STEP_FINISH].join("\n");
+    const result = makeFullResult({ stdout });
+    const output = parseOpenCodeOutput(result);
+    expect(output.assistantText).toBe("READY");
+  });
+
+  it("rejects timedOut via minimal input", () => {
+    const stdout = [STEP_START, TEXT_READY, STEP_FINISH].join("\n");
+    const result: OpenCodeOutputParseInput = {
+      stdout,
+      stderr: "",
+      timedOut: true,
+      aborted: false,
+      stdoutTruncated: false,
+    };
+    expect(() => parseOpenCodeOutput(result)).toThrow(OpenCodeOutputParseError);
+    expect(() => parseOpenCodeOutput(result)).toThrow(/timeout/);
+  });
+
+  it("rejects aborted via minimal input", () => {
+    const stdout = [STEP_START, TEXT_READY, STEP_FINISH].join("\n");
+    const result: OpenCodeOutputParseInput = {
+      stdout,
+      stderr: "",
+      timedOut: false,
+      aborted: true,
+      stdoutTruncated: false,
+    };
+    expect(() => parseOpenCodeOutput(result)).toThrow(OpenCodeOutputParseError);
+    expect(() => parseOpenCodeOutput(result)).toThrow(/abortado/);
+  });
+
+  it("rejects truncated via minimal input", () => {
+    const stdout = [STEP_START, TEXT_READY, STEP_FINISH].join("\n");
+    const result: OpenCodeOutputParseInput = {
+      stdout,
+      stderr: "",
+      timedOut: false,
+      aborted: false,
+      stdoutTruncated: true,
+    };
+    expect(() => parseOpenCodeOutput(result)).toThrow(OpenCodeOutputParseError);
+    expect(() => parseOpenCodeOutput(result)).toThrow(/truncado/);
+  });
+
+  it("rejects empty stdout via minimal input", () => {
+    const result: OpenCodeOutputParseInput = {
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      aborted: false,
+      stdoutTruncated: false,
+    };
+    expect(() => parseOpenCodeOutput(result)).toThrow(OpenCodeOutputParseError);
+    expect(() => parseOpenCodeOutput(result)).toThrow(/vacío/);
+  });
+
+  it("preserves existing error codes from minimal input", () => {
+    const result: OpenCodeOutputParseInput = {
+      stdout: "not-json\n",
+      stderr: "",
+      timedOut: false,
+      aborted: false,
+      stdoutTruncated: false,
+    };
+    try {
+      parseOpenCodeOutput(result);
+      expect.fail("should have thrown");
+    } catch (error) {
+      expect(error).toBeInstanceOf(OpenCodeOutputParseError);
+      expect((error as OpenCodeOutputParseError).code).toBe("INVALID_JSON_LINE");
+    }
+  });
+});
 
 describe("parseOpenCodeOutput", () => {
   describe("basic parsing", () => {

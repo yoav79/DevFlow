@@ -1,6 +1,16 @@
 /// <reference types="node" />
 
-import type { OpenCodeProcessResult } from "./opencode-process-runner.js";
+// ---------------------------------------------------------------------------
+// Narrow input interface (subset of OpenCodeProcessResult — only fields the parser reads)
+// ---------------------------------------------------------------------------
+
+export interface OpenCodeOutputParseInput {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly timedOut: boolean;
+  readonly aborted: boolean;
+  readonly stdoutTruncated: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // Transport event types
@@ -459,7 +469,7 @@ function validateUnknown(event: Record<string, unknown>, raw: unknown, lineNumbe
 // ---------------------------------------------------------------------------
 
 export function parseOpenCodeOutput(
-  result: OpenCodeProcessResult,
+  result: OpenCodeOutputParseInput,
 ): ParsedOpenCodeOutput {
   if (result.stdoutTruncated) {
     throw new OpenCodeOutputParseError(
